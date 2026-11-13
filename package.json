@@ -1,0 +1,33 @@
+{
+  "name": "@hestia-projekt/timon-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Host plugin that will expose a Streamable HTTP MCP server. This release is the skeleton: a health route only.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hestia-projekt/timon-mcp.git"
+  },
+  "timon": {
+    "id": "timon-mcp",
+    "apiVersion": 15,
+    "kind": "behavior",
+    "label": "Timon MCP",
+    "description": "Streamable HTTP MCP server that forwards mandates to the pilot. Skeleton: health route only.",
+    "permissions": []
+  }
+}
