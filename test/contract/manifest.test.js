@@ -41,7 +41,20 @@ test('manifest id, api version and kind', () => {
   assert.equal(typeof manifest.description, 'string');
   assert.ok(manifest.description.length > 0);
   assert.ok(Array.isArray(manifest.permissions));
-  assert.deepEqual(manifest.permissions, []);
+});
+
+test('manifest permissions and the public MCP route are exactly the step 2 set', () => {
+  assert.deepEqual(pkg.timon.permissions, [
+    'http:public',
+    'missions:spawn',
+    'missions:read',
+    'missions:control',
+    'kanban:read',
+    'kanban:write',
+  ]);
+  assert.deepEqual(pkg.timon.routes, {
+    publicPaths: [{ method: 'POST', path: '/mcp' }],
+  });
 });
 
 test('package is the private ESM entry point', () => {
