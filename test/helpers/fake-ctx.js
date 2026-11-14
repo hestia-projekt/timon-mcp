@@ -6,12 +6,20 @@
  * The HTTP server speaks `node:http`. Routes registered with `ctx.router()`
  * are mounted at `/api/plugins/<id>/`, which is where the daemon mounts them.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createResponse, createRouter } from './mini-router.js';
+
+/**
+ * Store entered for the duration of an HTTP request. A façade call made from
+ * the handler records this store. A call made from the plugin's job pump,
+ * which was armed outside the request, records `null`.
+ */
+export const requestContext = new AsyncLocalStorage();
 
 const BODY_LIMIT = 1024 * 1024;
 
@@ -40,8 +48,6 @@ export class PluginPolicyError extends Error {
     this.name = 'PluginPolicyError';
     this.pluginId = pluginId;
     this.rule = rule;
-    // The daemon exposes `rule`. `code` mirrors it so callers branch once.
-    this.code = rule;
   }
 }
 
@@ -85,9 +91,11 @@ export async function createFakeCtx(options = {}) {
   const prefix = `/api/plugins/${encodeURIComponent(id)}`;
   const state = createState(options);
   const routers = [];
+  const disposers = [];
   const storageDir = mkdtempSync(join(tmpdir(), 'timon-mcp-'));
 
-  const server = createServer(async (incoming, raw) => {
+  const server = createServer((incoming, raw) => {
+    requestContext.run({ scope: 'request' }, async () => {
     const response = createResponse(raw);
     try {
       const mounted = mountRequest(incoming, prefix);
@@ -106,6 +114,16 @@ export async function createFakeCtx(options = {}) {
       }
       if (response.headersSent) return;
       if (pending) {
+        // Body-parser failures are raised by this double (`invalid_json`,
+        // `body_too_large`). They are not a behavior of the plugin.
+        const described = httpErrorOf(pending);
+        if (described) {
+          response.status(described.status).json({
+            error: described.error,
+            message: described.message,
+          });
+          return;
+        }
         response.status(500).json({ error: 'internal_error' });
         return;
       }
@@ -116,6 +134,7 @@ export async function createFakeCtx(options = {}) {
     } catch {
       if (!response.headersSent) response.status(500).json({ error: 'internal_error' });
     }
+    });
   });
 
   await new Promise((resolve, reject) => {
@@ -136,8 +155,25 @@ export async function createFakeCtx(options = {}) {
       routers.push(router);
       return router;
     },
-    missions: createMissions(state),
-    kanban: createKanban(state),
+    missions: traceFacade(state, 'missions', createMissions(state)),
+    kanban: traceFacade(state, 'kanban', createKanban(state)),
+    events: {
+      on(kind, handler) {
+        if (typeof kind !== 'string' || typeof handler !== 'function') {
+          throw new TypeError('events.on requires a kind and a handler');
+        }
+        const entry = { kind, handler };
+        state.listeners.push(entry);
+        return () => {
+          const index = state.listeners.indexOf(entry);
+          if (index >= 0) state.listeners.splice(index, 1);
+        };
+      },
+    },
+    effect(fn) {
+      const returned = typeof fn === 'function' ? fn() : undefined;
+      if (typeof returned === 'function') disposers.push(returned);
+    },
     secrets: {
       async get(name) {
         if (typeof name !== 'string' || !name) return undefined;
@@ -171,6 +207,9 @@ export async function createFakeCtx(options = {}) {
     state,
     baseUrl: `http://127.0.0.1:${address.port}`,
     close() {
+      for (const dispose of disposers.splice(0)) {
+        try { dispose(); } catch { /* the test still closes the server */ }
+      }
       return new Promise((resolve, reject) => {
         server.close((error) => {
           rmSync(storageDir, { recursive: true, force: true });
@@ -195,7 +234,40 @@ function createState(options) {
     secrets: new Map(Object.entries(options.secrets ?? {})),
     settings: { ...(options.settings ?? {}) },
     kv: new Map(),
+    calls: [],
+    listeners: [],
+    emit(kind, payload) {
+      for (const entry of [...this.listeners]) {
+        if (entry.kind === kind) entry.handler(payload);
+      }
+    },
   };
+}
+
+/**
+ * Records the AsyncLocalStorage store active at each façade call.
+ * @param {object} state
+ * @param {string} facade
+ * @param {object} target
+ */
+function traceFacade(state, facade, target) {
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (typeof prop === 'symbol') return Reflect.get(obj, prop, receiver);
+      const value = Reflect.get(obj, prop, receiver);
+      if (value && typeof value === 'object') return traceFacade(state, facade, value);
+      if (typeof value !== 'function') return value;
+      return function traced(...args) {
+        state.calls.push({
+          facade,
+          method: String(prop),
+          store: requestContext.getStore() ?? null,
+          args,
+        });
+        return value.apply(obj, args);
+      };
+    },
+  });
 }
 
 function createMissions(state) {
@@ -214,6 +286,9 @@ function createMissions(state) {
         mission: input.mission,
         status: 'running',
         title: input.title ?? null,
+        summary: null,
+        started_at: Date.now(),
+        ended_at: null,
         messages: [],
       });
       return missionId;
@@ -295,6 +370,7 @@ function createKanban(state) {
     async list(opts = {}) {
       let rows = [...state.tasks.values()];
       if (opts.status) rows = rows.filter((row) => row.status === opts.status);
+      if (opts.project) rows = rows.filter((row) => row.project === opts.project);
       const limit = opts.limit ?? 50;
       return rows.slice(0, limit);
     },
@@ -302,12 +378,18 @@ function createKanban(state) {
       if (!input || typeof input.title !== 'string' || !input.title.trim()) {
         throw new PluginTaskError('invalid', 'title is required');
       }
+      const now = Date.now();
       const task = {
         id: randomUUID(),
         title: input.title,
         description: input.description ?? '',
         status: 'PENDING',
         agent: input.agent ?? null,
+        agent_name: input.agent ?? null,
+        project: input.project ?? null,
+        type: input.type ?? 'chore',
+        created_at: now,
+        updated_at: now,
         links: [],
       };
       state.tasks.set(task.id, task);
@@ -511,6 +593,20 @@ function readRaw(incoming) {
       if (!failed) reject(error);
     });
   });
+}
+
+/**
+ * @param {unknown} error
+ * @returns {{ status: number, error: string, message: string } | null}
+ */
+function httpErrorOf(error) {
+  if (!error || typeof error !== 'object') return null;
+  const record = /** @type {{ status?: unknown, code?: unknown, message?: unknown }} */ (error);
+  const status = Number(record.status);
+  if (!Number.isInteger(status) || status < 400 || status > 599) return null;
+  if (typeof record.code !== 'string' || !record.code) return null;
+  const message = typeof record.message === 'string' && record.message ? record.message : record.code;
+  return { status, error: record.code, message };
 }
 
 /**

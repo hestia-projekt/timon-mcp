@@ -6,18 +6,30 @@
 
 /**
  * @param {string | null} path
+ * @param {'exact' | 'prefix'} mode `use(path)` is a prefix mount, like Express.
  */
-function compile(path) {
+function compile(path, mode) {
   if (path == null) return null;
+  const normalized = mode === 'prefix' ? stripTrailingSlash(path) : path;
+  if (mode === 'prefix' && (normalized === '' || normalized === '/')) return null;
   const keys = [];
-  const body = path.split('/').map((segment) => {
+  const body = normalized.split('/').map((segment) => {
     if (segment.startsWith(':') && segment.length > 1) {
       keys.push(segment.slice(1));
       return '([^/]+)';
     }
     return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }).join('/');
-  return { keys, re: new RegExp(`^${body}/?$`) };
+  const tail = mode === 'prefix' ? '(?=/|$)' : '/?$';
+  return { keys, re: new RegExp(`^${body}${tail}`) };
+}
+
+/**
+ * @param {string} path
+ */
+function stripTrailingSlash(path) {
+  if (path.length > 1 && path.endsWith('/')) return path.replace(/\/+$/, '');
+  return path;
 }
 
 /**
@@ -33,22 +45,38 @@ function methodMatches(method, actual) {
 /**
  * @param {{ path: string | null, keys: string[], re: RegExp | null }} layer
  * @param {{ path: string }} req
- * @returns {Record<string, string> | null}
+ * @returns {{ params: Record<string, string>, matched: string } | null}
  */
 function matchPath(layer, req) {
-  if (!layer.re) return {};
-  const found = layer.re.exec(req.path);
+  if (!layer.re) return { params: {}, matched: '' };
+  const found = layer.re.exec(req.path || '/');
   if (!found) return null;
   /** @type {Record<string, string>} */
   const params = {};
   layer.keys.forEach((key, index) => {
     params[key] = decodeURIComponent(found[index + 1]);
   });
-  return params;
+  return { params, matched: found[0] };
+}
+
+/**
+ * Express strips the mount path for the duration of a `use(path)` handler.
+ * @param {string | undefined} value
+ * @param {string} matched
+ * @param {boolean} keepSearch
+ */
+function remainder(value, matched, keepSearch) {
+  const raw = typeof value === 'string' && value ? value : '/';
+  const queryAt = raw.indexOf('?');
+  const pathname = queryAt === -1 ? raw : raw.slice(0, queryAt);
+  const search = queryAt === -1 ? '' : raw.slice(queryAt);
+  let rest = pathname.startsWith(matched) ? pathname.slice(matched.length) : pathname;
+  if (!rest.startsWith('/')) rest = `/${rest}`;
+  return keepSearch ? `${rest}${search}` : rest;
 }
 
 export function createRouter() {
-  /** @type {Array<{ method: string, path: string | null, keys: string[], re: RegExp | null, handle: Function, error: boolean }>} */
+  /** @type {Array<{ method: string, path: string | null, keys: string[], re: RegExp | null, prefix: boolean, handle: Function, error: boolean }>} */
   const layers = [];
 
   /**
@@ -57,7 +85,7 @@ export function createRouter() {
    * @param {Function[]} handlers
    */
   function add(method, path, handlers) {
-    const compiled = compile(path);
+    const compiled = compile(path, 'exact');
     for (const handle of handlers) {
       if (typeof handle !== 'function') {
         throw new TypeError('router handler must be a function');
@@ -67,6 +95,7 @@ export function createRouter() {
         path,
         keys: compiled ? compiled.keys : [],
         re: compiled ? compiled.re : null,
+        prefix: false,
         handle,
         error: false,
       });
@@ -87,7 +116,7 @@ export function createRouter() {
     use(path, ...handlers) {
       const list = typeof path === 'function' ? [path, ...handlers] : handlers;
       const mount = typeof path === 'function' ? null : path;
-      const compiled = compile(mount);
+      const compiled = compile(mount, 'prefix');
       for (const handle of list) {
         if (typeof handle !== 'function') {
           throw new TypeError('router handler must be a function');
@@ -97,6 +126,7 @@ export function createRouter() {
           path: mount,
           keys: compiled ? compiled.keys : [],
           re: compiled ? compiled.re : null,
+          prefix: true,
           handle,
           error: handle.length >= 4,
         });
@@ -136,24 +166,40 @@ export function createRouter() {
             step(err);
             return;
           }
-          const params = matchPath(layer, req);
-          if (!params) {
+          const hit = matchPath(layer, req);
+          if (!hit) {
             step(err);
             return;
           }
-          const previous = req.params;
-          req.params = params;
+          const previous = {
+            params: req.params,
+            path: req.path,
+            url: req.url,
+            baseUrl: req.baseUrl,
+          };
+          req.params = hit.params;
+          if (layer.prefix && hit.matched) {
+            req.path = remainder(req.path, hit.matched, false);
+            req.url = remainder(req.url, hit.matched, true);
+            req.baseUrl = `${typeof req.baseUrl === 'string' ? req.baseUrl : ''}${hit.matched}`;
+          }
           let called = false;
+          const restore = () => {
+            req.params = previous.params;
+            req.path = previous.path;
+            req.url = previous.url;
+            req.baseUrl = previous.baseUrl;
+          };
           const next = (nextErr) => {
             if (called) return;
             called = true;
-            req.params = previous;
+            restore();
             step(nextErr);
           };
           const finish = () => {
             if (called) return;
             called = true;
-            req.params = previous;
+            restore();
             if (res.headersSent) resolve(null);
             else step(err);
           };
