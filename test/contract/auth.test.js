@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 import { authenticate } from '../../lib/auth/index.js';
-import { BEARER_SECRET, MAX_DCR_CLIENTS } from '../../lib/constants.js';
+import { BEARER_SECRET, MAX_DCR_CLIENTS, STALE_CLIENT_MS } from '../../lib/constants.js';
 import { apply } from '../../lib/index.js';
 import { createFakeCtx } from '../helpers/fake-ctx.js';
 
@@ -100,6 +100,70 @@ test('registration stops at the client cap', async (t) => {
   assert.equal(response.json.error, 'invalid_client_metadata');
 });
 
+test('registration reclaims stale clients that hold nothing live', async (t) => {
+  const opened = await open(t, { settings: settings() });
+  const stale = Date.now() - STALE_CLIENT_MS - 1000;
+  const insert = opened.ctx.sql.prepare(
+    'INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)',
+  );
+  const revoked = opened.ctx.sql.prepare(
+    `INSERT INTO oauth_tokens
+      (token_hash, kind, client_id, resource, subject, family_id, expires_at, revoked_at, created_at)
+     VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (let index = 0; index < MAX_DCR_CLIENTS; index += 1) {
+    const clientId = `stale-${index}`;
+    insert.run(clientId, 'n', '[]', stale);
+    revoked.run(`revoked-${index}`, clientId, RESOURCE, 'subject', `family-${index}`, Date.now() + 60_000, stale, stale);
+  }
+  const response = await registerClient(opened, [REDIRECT]);
+  assert.equal(response.response.status, 201);
+  assert.equal(typeof response.json.client_id, 'string');
+  assert.equal(count(opened, 'oauth_clients'), 1);
+  const kept = opened.ctx.sql.prepare('SELECT client_id FROM oauth_clients').get();
+  assert.equal(kept.client_id, response.json.client_id);
+});
+
+test('registration keeps the cap when stale clients still hold a live token', async (t) => {
+  const opened = await open(t, { settings: settings() });
+  const now = Date.now();
+  const stale = now - STALE_CLIENT_MS - 1000;
+  const later = now + 60_000;
+  const insert = opened.ctx.sql.prepare(
+    'INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)',
+  );
+  const token = opened.ctx.sql.prepare(
+    `INSERT INTO oauth_tokens
+      (token_hash, kind, client_id, resource, subject, family_id, expires_at, revoked_at, created_at)
+     VALUES (?, 'access', ?, ?, ?, ?, ?, NULL, ?)`,
+  );
+  const code = opened.ctx.sql.prepare(
+    `INSERT INTO oauth_codes
+      (code_hash, client_id, redirect_uri, code_challenge, resource, subject, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const consent = opened.ctx.sql.prepare(
+    `INSERT INTO oauth_requests
+      (request_id, csrf_hash, client_id, redirect_uri, code_challenge, resource, subject, state, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+  );
+  for (let index = 0; index < MAX_DCR_CLIENTS; index += 1) {
+    const clientId = `live-${index}`;
+    insert.run(clientId, 'n', '[]', stale);
+    if (index === 0) {
+      code.run(`code-${index}`, clientId, REDIRECT, 'challenge', RESOURCE, 'subject', later);
+    } else if (index === 1) {
+      consent.run(`request-${index}`, `csrf-${index}`, clientId, REDIRECT, 'challenge', RESOURCE, 'subject', later);
+    } else {
+      token.run(`hash-${index}`, clientId, RESOURCE, 'subject', `family-${index}`, later, stale);
+    }
+  }
+  const response = await registerClient(opened, [REDIRECT]);
+  assert.equal(response.response.status, 403);
+  assert.equal(response.json.error, 'invalid_client_metadata');
+  assert.equal(count(opened, 'oauth_clients'), MAX_DCR_CLIENTS);
+});
+
 test('authorization issues a code only for an allowlisted identity', async (t) => {
   const address = email();
   const other = email();
@@ -133,8 +197,18 @@ test('authorization issues a code only for an allowlisted identity', async (t) =
   opened.state.settings.email_allowlist = address;
   opened.state.settings.identity_header = '';
   const unnamed = await authorize(opened, clientId, challenge, address);
-  assert.equal(unnamed.response.status, 403);
+  assert.equal(unnamed.response.status, 200);
+  assert.equal(unnamed.text.includes('action=""'), true);
+  assert.equal(unnamed.text.includes('Aucun code'), false);
+  assert.equal(unnamed.text.includes(address), false);
   assert.equal(count(opened, 'oauth_codes'), 0);
+  const unnamedDenied = await approve(opened, unnamed.text, address, 'deny');
+  assert.equal(unnamedDenied.response.status, 302);
+  const unnamedLocation = new URL(unnamedDenied.response.headers.get('location'));
+  assert.equal(unnamedLocation.searchParams.get('error'), 'access_denied');
+  assert.equal(unnamedLocation.searchParams.get('code'), null);
+  assert.equal(count(opened, 'oauth_codes'), 0);
+  assert.equal(count(opened, 'oauth_requests'), 0);
 
   delete opened.state.settings.identity_header;
   const mixed = address.replace('ada.', 'Ada.');
@@ -381,6 +455,29 @@ test('the static bearer is read from the vault and ignored when it is absent', a
   const unset = await open(t, { settings: settings(), secrets: {} });
   assert.equal((await mcp(unset, `Bearer ${token}`)).response.status, 401);
   assert.equal((await mcp(unset, 'Bearer')).response.status, 401);
+});
+
+test('an oauth failure logs the error name and not its message', async (t) => {
+  const opened = await open(t, { settings: settings() });
+  const secret = randomBytes(16).toString('hex');
+  const watch = spyConsole();
+  opened.ctx.sql.transaction = () => {
+    const error = new Error(`boom ${secret}`);
+    error.name = 'SqlBoom';
+    throw error;
+  };
+  try {
+    const response = await registerClient(opened, [REDIRECT]);
+    assert.equal(response.response.status, 500);
+    assert.equal(response.json.error, 'server_error');
+    assert.equal(response.text.includes(secret), false);
+    const journal = `${watch.lines.join('\n')}\n${opened.state.logs.map((entry) => entry.message).join('\n')}`;
+    assert.equal(journal.includes(secret), false);
+    assert.equal(journal.includes('boom'), false);
+    assert.equal(opened.state.logs.some((entry) => entry.message === 'oauth: request failed (SqlBoom)'), true);
+  } finally {
+    watch.restore();
+  }
 });
 
 test('the identity header is ignored on POST /mcp', async (t) => {

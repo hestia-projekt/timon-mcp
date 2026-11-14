@@ -44,9 +44,22 @@ Un jeton présent mais inutilisable, inconnu, expiré ou d'une autre audience aj
 
 Le jeton d'accès est opaque, 15 minutes. Le refresh token dure 30 jours, tourne à chaque usage, et se révoque. Présenter un refresh déjà tourné révoque toute sa famille, y compris le jeton qui l'a remplacé et les accès encore en cours de cette famille. Jusqu'à cette réutilisation, l'accès précédent reste valable jusqu'à son expiration. Le code d'autorisation est retiré à la première présentation, même si le vérificateur PKCE est faux.
 
-`redirect_uri` doit être `https`, ou `http` limité à `localhost` et `127.0.0.1` (les CLI). `http://localhost.evil.com` est refusé. L'URI est liée au client enregistré, comparaison exacte de la chaîne enregistrée. `code_challenge_method=plain` est refusé. Le nombre de clients dynamiques est borné à 128.
+`redirect_uri` doit être `https`, ou `http` limité à `localhost` et `127.0.0.1` (les CLI). `http://localhost.evil.com` est refusé. L'URI est liée au client enregistré, comparaison exacte de la chaîne enregistrée. `code_challenge_method=plain` est refusé. Le nombre de clients dynamiques est borné à 128. Quand ce plafond est atteint, la même transaction retire les clients créés depuis plus de 24 heures qui n'ont plus aucune ligne vivante : pas de jeton non révoqué encore avant `expires_at`, pas de code, pas de demande de consentement. Le décompte est refait ensuite. L'enregistrement répond `403` seulement si le plafond tient encore.
 
-Les codes, les jetons et le secret CSRF ne sont enregistrés qu'en empreinte SHA-256. Le sujet est l'empreinte de l'adresse, pas l'adresse. Les lignes expirées sont purgées. Rien de tout cela n'est écrit dans les journaux : le plugin n'y met que des phrases fixes (`oauth: client registered`, `oauth: code issued`, `oauth: tokens issued`, `oauth: refresh rotated`, `oauth: authorization refused`, `oauth: request failed`).
+La même suppression peut être lancée à la main sur la base du plugin. `cutoff` est l'instant courant moins 24 heures, `now_ms` est l'instant courant, les deux en millisecondes Unix :
+
+```sql
+DELETE FROM oauth_clients
+WHERE created_at < :cutoff
+  AND client_id NOT IN (
+    SELECT client_id FROM oauth_tokens
+    WHERE revoked_at IS NULL AND expires_at > :now_ms
+  )
+  AND client_id NOT IN (SELECT client_id FROM oauth_codes)
+  AND client_id NOT IN (SELECT client_id FROM oauth_requests);
+```
+
+Les codes, les jetons et le secret CSRF ne sont enregistrés qu'en empreinte SHA-256. Le sujet est l'empreinte de l'adresse, pas l'adresse. Les lignes expirées sont purgées. Rien de tout cela n'est écrit dans les journaux. Le plugin n'y met que des phrases fixes (`oauth: client registered`, `oauth: code issued`, `oauth: tokens issued`, `oauth: refresh rotated`, `oauth: authorization refused`). Un échec inattendu s'écrit `oauth: request failed (<nom>)`, où `<nom>` est `error.name` (par exemple `TypeError`). Le message de l'erreur n'est pas journalisé.
 
 ## Réglages
 
@@ -57,7 +70,7 @@ Permission `settings`. Les valeurs sont lues à chaque requête. Vides au dépar
 | `public_url` | Origine publique du plugin, sans barre finale. Sert au défi `resource_metadata`. Exemple fictif : `https://mcp.example`. |
 | `issuer` | Émetteur OAuth, sans barre finale. Le plugin est le serveur d'autorisation. Souvent la même origine. |
 | `resource` | Adresse canonique du point MCP, valeur du paramètre `resource`. Exemple fictif : `https://mcp.example/mcp`. |
-| `identity_header` | En-tête lu uniquement sur `/oauth/authorize`. Tant que la valeur n'a jamais été enregistrée, le plugin utilise le nom livré avec lui. Une valeur enregistrée vide désactive cet en-tête et refuse toute autorisation. Ne pas vider le champ en enregistrant les autres réglages : s'il faut le fixer, le renseigner explicitement. |
+| `identity_header` | En-tête lu uniquement sur `/oauth/authorize`. Tant que la valeur n'est pas enregistrée, ou qu'elle est enregistrée vide, le plugin utilise le nom livré avec lui, `x-ambactos-email`. Une valeur non vide le remplace. <!-- timon-check: nom livré de l'en-tête quand le réglage est vide --> |
 | `expected_right` | Nom du droit attendu sur la surface. Défaut `timon`. Documentaire : aucun en-tête de droit n'est lu. Il apparaît sur la page de refus. |
 | `email_allowlist` | Adresses autorisées, séparées par des virgules, des espaces ou des points-virgules. Vide : tout refuser. |
 
@@ -81,7 +94,7 @@ Elle transmet à l'amont un seul en-tête, `x-ambactos-email`. <!-- timon-check:
 
 Il n'y a pas d'en-tête de droit, de niveau, ni de marqueur interne ou externe. Le plugin n'en suppose aucun. `expected_right` n'est qu'un libellé.
 
-`IdentityResolver` (`lib/auth/identity.js`) répond `{ subject, email }` ou `null`. Il refuse si le nom d'en-tête n'est pas configuré, si l'en-tête est absent ou vide, ou si l'adresse n'est pas dans l'allowlist. Une allowlist vide refuse tout le monde. Le refus est une page HTML, sans redirection et sans code. L'adresse n'est pas affichée.
+`IdentityResolver` (`lib/auth/identity.js`) répond `{ subject, email }` ou `null`. Le nom d'en-tête vient du réglage s'il est renseigné, sinon de la valeur livrée `x-ambactos-email`, y compris quand la valeur enregistrée est vide. <!-- timon-check: même nom livré, valeur par défaut du réglage vide --> Il refuse si l'en-tête est absent ou vide, ou si l'adresse n'est pas dans l'allowlist. Une allowlist vide refuse tout le monde. Le refus est une page HTML, sans redirection et sans code. L'adresse n'est pas affichée.
 
 L'en-tête n'est lu que sur `GET` et `POST /oauth/authorize`. Sur `/mcp` et sur les autres routes, il est ignoré : il ne tient pas lieu de jeton.
 
@@ -106,13 +119,14 @@ Cela convient à `/oauth/token`, `/oauth/register` et aux métadonnées. Le cons
 Le frontal, plus tard, réécrit les URL publiques vers le préfixe du plugin. Hôte fictif, rien n'est installé ici :
 
 ```nginx
+proxy_set_header Host $host;
 rewrite ^/.well-known/oauth-protected-resource$ /api/plugins/timon-mcp/oauth/protected-resource last;
 rewrite ^/.well-known/oauth-authorization-server$ /api/plugins/timon-mcp/oauth/authorization-server last;
 rewrite ^/oauth/(.*)$ /api/plugins/timon-mcp/oauth/$1 last;
 rewrite ^/mcp$ /api/plugins/timon-mcp/mcp last;
 ```
 
-`/mcp` doit transmettre `Authorization` jusqu'au daemon. Les chemins publics vident l'en-tête d'identité avant la passerelle, comme dit plus haut. `proxy_pass` vers `http://<daemon>` reste un exemple : l'adresse réelle est un réglage de l'opérateur, pas une valeur du plugin.
+Le daemon compare `Origin` à `Host`. `proxy_set_header Host $host;` transmet l'hôte public vu par le client. Sans cette ligne, le daemon verrait l'adresse amont et refuserait une `Origin` du même site. `/mcp` doit transmettre `Authorization` jusqu'au daemon. Les chemins publics vident l'en-tête d'identité avant la passerelle, comme dit plus haut. `proxy_pass` vers `http://<daemon>` reste un exemple : l'adresse réelle est un réglage de l'opérateur, pas une valeur du plugin.
 
 ## Clients
 
