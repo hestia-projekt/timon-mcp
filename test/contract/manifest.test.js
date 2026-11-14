@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { BEARER_SECRET } from '../../lib/constants.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 
@@ -43,7 +44,7 @@ test('manifest id, api version and kind', () => {
   assert.ok(Array.isArray(manifest.permissions));
 });
 
-test('manifest permissions and the public MCP route are exactly the step 2 set', () => {
+test('manifest permissions, secrets, settings and public routes are exactly the step 3 set', () => {
   assert.deepEqual(pkg.timon.permissions, [
     'http:public',
     'missions:spawn',
@@ -51,10 +52,41 @@ test('manifest permissions and the public MCP route are exactly the step 2 set',
     'missions:control',
     'kanban:read',
     'kanban:write',
+    'settings',
+    'secrets:read',
+    'storage:sql',
   ]);
-  assert.deepEqual(pkg.timon.routes, {
-    publicPaths: [{ method: 'POST', path: '/mcp' }],
-  });
+  assert.deepEqual(pkg.timon.routes.publicPaths, [
+    { method: 'POST', path: '/mcp' },
+    { method: 'GET', path: '/oauth/protected-resource' },
+    { method: 'GET', path: '/oauth/authorization-server' },
+    { method: 'POST', path: '/oauth/register' },
+    { method: 'GET', path: '/oauth/authorize' },
+    { method: 'POST', path: '/oauth/authorize' },
+    { method: 'POST', path: '/oauth/token' },
+  ]);
+  assert.ok(pkg.timon.routes.publicPaths.length <= 10);
+  assert.equal(pkg.timon.migrations, 'migrations');
+  assert.deepEqual(pkg.files, ['lib', 'migrations', 'README.md']);
+  assert.equal(pkg.timon.secrets.length, 1);
+  assert.equal(pkg.timon.secrets[0].name, BEARER_SECRET);
+  assert.equal(pkg.timon.secrets[0].mode, 'read');
+  assert.equal(pkg.timon.secrets[0].why.includes(BEARER_SECRET), false);
+  assert.ok(pkg.timon.secrets[0].why.length > 0);
+  assert.ok(pkg.timon.secrets[0].why.length <= 200);
+  assert.deepEqual(pkg.timon.settings.map((item) => item.key), [
+    'public_url',
+    'issuer',
+    'resource',
+    'identity_header',
+    'expected_right',
+    'email_allowlist',
+  ]);
+  const right = pkg.timon.settings.find((item) => item.key === 'expected_right');
+  assert.equal(right.default, 'timon');
+  const header = pkg.timon.settings.find((item) => item.key === 'identity_header');
+  assert.equal(header.default, undefined);
+  assert.equal(JSON.stringify(pkg.timon.secrets).includes('TIMON_MCP_OAUTH_KEY'), false);
 });
 
 test('package is the private ESM entry point', () => {
@@ -88,6 +120,9 @@ test('forbidden permission blacklist rejects configuration rights', () => {
   }
   assert.equal(isForbiddenPermission('missions:read'), false);
   assert.equal(isForbiddenPermission('kanban:read'), false);
+  assert.equal(isForbiddenPermission('settings'), false);
+  assert.equal(isForbiddenPermission('secrets:read'), false);
+  assert.equal(isForbiddenPermission('storage:sql'), false);
 });
 
 test('manifest declares none of the forbidden permissions', () => {

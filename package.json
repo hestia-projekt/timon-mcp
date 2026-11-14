@@ -2,7 +2,7 @@
   "name": "@hestia-projekt/timon-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Host plugin that exposes a stateless Streamable HTTP MCP server. Clients mandate the pilot. The entry point is not authenticated yet.",
+  "description": "Host plugin that exposes a stateless Streamable HTTP MCP server. Clients mandate the pilot. POST /mcp requires a bearer token.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -10,6 +10,7 @@
   },
   "files": [
     "lib",
+    "migrations",
     "README.md"
   ],
   "engines": {
@@ -27,18 +28,43 @@
     "apiVersion": 15,
     "kind": "behavior",
     "label": "Timon MCP",
-    "description": "Streamable HTTP MCP server that forwards mandates to the pilot. The entry point is not authenticated yet.",
+    "description": "Streamable HTTP MCP server that forwards mandates to the pilot. POST /mcp requires a bearer token.",
     "permissions": [
       "http:public",
       "missions:spawn",
       "missions:read",
       "missions:control",
       "kanban:read",
-      "kanban:write"
+      "kanban:write",
+      "settings",
+      "secrets:read",
+      "storage:sql"
     ],
+    "settings": [
+      { "key": "public_url", "type": "string", "label": "URL publique du plugin, sans barre finale" },
+      { "key": "issuer", "type": "string", "label": "Émetteur OAuth, sans barre finale" },
+      { "key": "resource", "type": "string", "label": "Adresse publique du point MCP (paramètre resource)" },
+      { "key": "identity_header", "type": "string", "label": "En-tête d'identité lu uniquement sur /oauth/authorize" },
+      { "key": "expected_right", "type": "string", "label": "Droit attendu, documentaire : aucun en-tête de droit n'est lu", "default": "timon" },
+      { "key": "email_allowlist", "type": "string", "label": "Adresses autorisées, séparées par des virgules. Vide : tout refuser" }
+    ],
+    "secrets": [
+      {
+        "name": "TIMON_MCP_BEARER_TOKEN",
+        "mode": "read",
+        "why": "Jeton porteur statique des CLI locales. Accordé au plugin, jamais écrit dans le dépôt."
+      }
+    ],
+    "migrations": "migrations",
     "routes": {
       "publicPaths": [
-        { "method": "POST", "path": "/mcp" }
+        { "method": "POST", "path": "/mcp" },
+        { "method": "GET", "path": "/oauth/protected-resource" },
+        { "method": "GET", "path": "/oauth/authorization-server" },
+        { "method": "POST", "path": "/oauth/register" },
+        { "method": "GET", "path": "/oauth/authorize" },
+        { "method": "POST", "path": "/oauth/authorize" },
+        { "method": "POST", "path": "/oauth/token" }
       ]
     }
   }

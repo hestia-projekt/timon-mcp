@@ -9,9 +9,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 import { createResponse, createRouter } from './mini-router.js';
 
 /**
@@ -147,6 +149,8 @@ export async function createFakeCtx(options = {}) {
     throw new Error('fake ctx failed to bind a local port');
   }
 
+  const logs = [];
+  const sql = createSql();
   const ctx = {
     id,
     user: () => options.user,
@@ -199,8 +203,15 @@ export async function createFakeCtx(options = {}) {
         },
       },
     },
-    sql: createSql(),
+    sql: sql.facade,
+    log: {
+      info(...args) { record(logs, 'info', args); },
+      warn(...args) { record(logs, 'warn', args); },
+      error(...args) { record(logs, 'error', args); },
+      debug(...args) { record(logs, 'debug', args); },
+    },
   };
+  state.logs = logs;
 
   return {
     ctx,
@@ -212,6 +223,7 @@ export async function createFakeCtx(options = {}) {
       }
       return new Promise((resolve, reject) => {
         server.close((error) => {
+          try { sql.close(); } catch { /* the test still reports the close error */ }
           rmSync(storageDir, { recursive: true, force: true });
           if (error) reject(error);
           else resolve();
@@ -483,19 +495,57 @@ function findTaskByRef(state, provider, ref) {
   return undefined;
 }
 
+/**
+ * In-memory `ctx.sql`. The daemon applies `migrations/` before `apply`;
+ * this double does the same when the context is created.
+ */
 function createSql() {
-  return {
-    prepare() {
+  const db = new DatabaseSync(':memory:');
+  const dir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'migrations');
+  const files = readdirSync(dir).filter((name) => name.endsWith('.sql')).sort();
+  for (const name of files) db.exec(readFileSync(join(dir, name), 'utf8'));
+  const facade = {
+    prepare(sql) {
+      const stmt = db.prepare(sql);
       return {
-        get() { return undefined; },
-        all() { return []; },
-        run() { return { changes: 0, lastInsertRowid: 0 }; },
+        get(...params) {
+          const row = stmt.get(...params);
+          return row === undefined ? undefined : row;
+        },
+        all(...params) {
+          return stmt.all(...params);
+        },
+        run(...params) {
+          const result = stmt.run(...params);
+          return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) };
+        },
       };
     },
     transaction(fn) {
-      return fn();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const value = fn();
+        db.exec('COMMIT');
+        return value;
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch { /* the original error is the one that matters */ }
+        throw error;
+      }
     },
   };
+  return { facade, close: () => db.close() };
+}
+
+/**
+ * @param {object[]} logs
+ * @param {string} level
+ * @param {unknown[]} args
+ */
+function record(logs, level, args) {
+  logs.push({
+    level,
+    message: args.map((part) => (typeof part === 'string' ? part : JSON.stringify(part))).join(' '),
+  });
 }
 
 /**
@@ -543,6 +593,15 @@ function readJsonBody(incoming, request) {
   const method = incoming.method || 'GET';
   if (method === 'GET' || method === 'HEAD') return Promise.resolve(null);
   const type = incoming.headers['content-type'];
+  if (typeof type === 'string' && type.toLowerCase().includes('application/x-www-form-urlencoded')) {
+    return readRaw(incoming).then((raw) => {
+      /** @type {Record<string, string>} */
+      const fields = {};
+      for (const [key, value] of new URLSearchParams(raw.toString('utf8'))) fields[key] = value;
+      request.body = fields;
+      return null;
+    }, (error) => error);
+  }
   if (typeof type !== 'string' || !type.toLowerCase().includes('application/json')) {
     return Promise.resolve(null);
   }
