@@ -91,6 +91,7 @@ test('manifest permissions, secrets, settings and public routes are exactly the 
 
 test('package is the private ESM entry point', () => {
   assert.equal(pkg.name, '@hestia-projekt/timon-mcp');
+  assert.equal(pkg.license, 'AGPL-3.0-only');
   assert.equal(pkg.private, true);
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.main, 'lib/index.js');

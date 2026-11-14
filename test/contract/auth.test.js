@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 import { authenticate } from '../../lib/auth/index.js';
-import { BEARER_SECRET, MAX_DCR_CLIENTS, STALE_CLIENT_MS } from '../../lib/constants.js';
+import { BEARER_SECRET, DEFAULT_IDENTITY_HEADER, MAX_DCR_CLIENTS, STALE_CLIENT_MS } from '../../lib/constants.js';
 import { apply } from '../../lib/index.js';
 import { createFakeCtx } from '../helpers/fake-ctx.js';
 
@@ -12,6 +12,10 @@ const RESOURCE = `${PUBLIC}/mcp`;
 const REDIRECT = 'https://client.example/cb';
 const META = `Bearer resource_metadata="${PUBLIC}/.well-known/oauth-protected-resource"`;
 const INVALID = `${META}, error="invalid_token"`;
+
+test('the default identity header is the generic proxy name', () => {
+  assert.equal(DEFAULT_IDENTITY_HEADER, 'x-forwarded-email');
+});
 
 test('OAuth metadata follows the protected-resource and authorization-server documents', async (t) => {
   const silent = await open(t, { settings: {} });
@@ -175,7 +179,7 @@ test('authorization issues a code only for an allowlisted identity', async (t) =
   const absent = await authorize(opened, clientId, challenge, undefined);
   assert.equal(absent.response.status, 403);
   assert.equal(absent.response.headers.get('location'), null);
-  assert.equal(absent.text.includes('Aucun code'), true);
+  assert.equal(absent.text.includes('No authorization code'), true);
   assert.equal(absent.text.includes(address), false);
   assert.equal(absent.text.includes('timon'), true);
   assert.equal(count(opened, 'oauth_codes'), 0);
@@ -199,7 +203,7 @@ test('authorization issues a code only for an allowlisted identity', async (t) =
   const unnamed = await authorize(opened, clientId, challenge, address);
   assert.equal(unnamed.response.status, 200);
   assert.equal(unnamed.text.includes('action=""'), true);
-  assert.equal(unnamed.text.includes('Aucun code'), false);
+  assert.equal(unnamed.text.includes('No authorization code'), false);
   assert.equal(unnamed.text.includes(address), false);
   assert.equal(count(opened, 'oauth_codes'), 0);
   const unnamedDenied = await approve(opened, unnamed.text, address, 'deny');
@@ -233,7 +237,7 @@ test('authorization issues a code only for an allowlisted identity', async (t) =
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
-      'x-ambactos-email': address,
+      [DEFAULT_IDENTITY_HEADER]: address,
     },
     body: form({ request_id: requestId, decision: 'approve' }),
   });
@@ -256,7 +260,7 @@ test('authorization issues a code only for an allowlisted identity', async (t) =
   });
   assert.equal(foreignRedirect.response.status, 400);
   assert.equal(foreignRedirect.response.headers.get('location'), null);
-  assert.equal(foreignRedirect.text.includes('Aucun code'), true);
+  assert.equal(foreignRedirect.text.includes('No authorization code'), true);
   assert.equal(count(opened, 'oauth_codes'), 0);
 
   const plain = await authorize(opened, clientId, challenge, address, {
@@ -490,7 +494,7 @@ test('the identity header is ignored on POST /mcp', async (t) => {
   const req = {
     headers: { authorization: `Bearer ${token}` },
     get(name) {
-      if (String(name).toLowerCase() === 'x-ambactos-email') throw new Error('identity header was read');
+      if (String(name).toLowerCase() === DEFAULT_IDENTITY_HEADER) throw new Error('identity header was read');
       return this.headers[String(name).toLowerCase()];
     },
   };
@@ -501,7 +505,7 @@ test('the identity header is ignored on POST /mcp', async (t) => {
     headers: {
       'content-type': 'application/json',
       accept: 'application/json',
-      'x-ambactos-email': address,
+      [DEFAULT_IDENTITY_HEADER]: address,
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
   });
@@ -596,7 +600,7 @@ function authQuery(clientId, challenge, over = {}) {
 function authorize(opened, clientId, challenge, address, over = {}) {
   /** @type {Record<string, string>} */
   const headers = {};
-  if (address !== undefined) headers['x-ambactos-email'] = address;
+  if (address !== undefined) headers[DEFAULT_IDENTITY_HEADER] = address;
   return http(opened, authQuery(clientId, challenge, over), { headers });
 }
 
@@ -611,7 +615,7 @@ function approve(opened, html, address, decision = 'approve') {
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
-      'x-ambactos-email': address,
+      [DEFAULT_IDENTITY_HEADER]: address,
     },
     body: form({
       request_id: hidden(html, 'request_id'),

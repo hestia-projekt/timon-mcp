@@ -94,12 +94,12 @@ test('tools/list returns exactly the six tools, each with a strict schema', asyn
   assert.equal(ctx.state.calls.length, 0);
 });
 
-test('an unknown tool is refused without calling a façade', async (t) => {
+test('an unknown tool is refused without calling a facade', async (t) => {
   const ctx = await open(t);
   const refused = await post(ctx, rpc('tools/call', { name: 'kill_mission', arguments: { mission_id: 'x' } }));
   assert.equal(refused.response.status, 200);
   assert.equal(refused.json.result.isError, true);
-  assert.equal(refused.json.result.content[0].text, 'outil inconnu');
+  assert.equal(refused.json.result.content[0].text, 'unknown tool');
   assert.equal(ctx.state.calls.length, 0);
 
   const extra = await post(ctx, rpc('tools/call', { name: 'ask_main', arguments: { message: 'bonjour', agent: 'other' } }));
@@ -178,7 +178,7 @@ test('ask_main with mission_id sends, and turn or process errors stay tool error
   }));
   assert.equal(busy.response.status, 200);
   assert.equal(busy.json.result.isError, true);
-  assert.match(busy.json.result.content[0].text, /tour est en cours/);
+  assert.match(busy.json.result.content[0].text, /turn is in progress/);
 
   ctx.missions.send = async () => {
     throw new PluginMissionError('not_running', 'no process');
@@ -188,10 +188,10 @@ test('ask_main with mission_id sends, and turn or process errors stay tool error
     arguments: { message: 'encore', mission_id: started.mission_id },
   }));
   assert.equal(dead.response.status, 200);
-  assert.match(dead.json.result.content[0].text, /pas de processus/);
+  assert.match(dead.json.result.content[0].text, /no running process/);
 });
 
-test('façade calls from the route are outside the request store', async (t) => {
+test('facade calls from the route are outside the request store', async (t) => {
   const ctx = await open(t);
   const before = ctx.state.calls.length;
   await post(ctx, rpc('tools/call', { name: 'ask_main', arguments: { message: 'bonjour' } }));
@@ -257,7 +257,7 @@ test('get_reply returns summary and state when the message body is not readable'
   const missing = await post(ctx, rpc('tools/call', { name: 'get_reply', arguments: { mission_id: 'absent' } }));
   assert.equal(missing.response.status, 200);
   assert.equal(missing.json.result.isError, true);
-  assert.match(missing.json.result.content[0].text, /introuvable/);
+  assert.match(missing.json.result.content[0].text, /not found/);
 });
 
 test('list_missions hides the prompt and list_tasks hides the description', async (t) => {

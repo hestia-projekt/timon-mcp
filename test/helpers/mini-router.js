@@ -227,7 +227,7 @@ export function createRouter() {
 }
 
 /**
- * Response façade with the Express methods the plugin calls.
+ * Response facade with the Express methods the plugin calls.
  * @param {import('node:http').ServerResponse} raw
  */
 export function createResponse(raw) {
