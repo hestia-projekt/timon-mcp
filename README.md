@@ -1,52 +1,94 @@
 # timon-mcp
 
-Plugin Timon (`behavior`, API 15) qui expose un serveur MCP Streamable HTTP. Un client MCP mandate le pilote. Le MCP mandate, le pilote orchestre : le plugin transmet le mandat et rapporte la réponse. Il ne modifie ni les agents, ni les serveurs MCP, ni les skills, ni les secrets, ni l'administration.
+Timon plugin (`behavior`, API 15) that exposes a stateless Streamable HTTP MCP server. An MCP client mandates the pilot. The MCP mandates, the pilot orchestrates: the plugin forwards the mandate and reports the reply. It does not change agents, MCP servers, skills, secrets, or administration.
 
-`POST /mcp` exige un jeton porteur. Sans les réglages d'URL, les routes OAuth répondent que le plugin n'est pas configuré. Ne pas installer le plugin sur un daemon en service pour l'instant : l'exposition réseau (frontal, DNS, certificat) est hors de ce dépôt.
+`POST /mcp` requires a bearer token. Without the URL settings, the OAuth routes answer that the plugin is not configured.
 
-## Point d'entrée
+Licensed under the GNU Affero General Public License v3.0 only. See `LICENSE`.
+
+## Install
+
+Node.js 22 or newer. From this directory, or from a packed archive:
+
+```bash
+timon plugin add .
+```
+
+`timon plugin add` accepts a folder, a `.tgz`, or a `.zip`.
+
+The package is not signed. Timon loads an unsigned plugin only on a licensed installation with developer mode open. In `timon.config.json`:
+
+```json
+{
+  "developer": {
+    "unsignedPlugins": true
+  }
+}
+```
+
+Without that flag the package can be installed and is not loaded. Developer mode does not bypass the licence.
+
+Until the plugin is signed, `missions:spawn` stays refused until the id is approved. Tasks created from the background identity go through the same policy and the same quota. In `timon.config.json`:
+
+```json
+{
+  "pluginPolicy": {
+    "spawn": {
+      "approved": ["timon-mcp"],
+      "max": 5,
+      "windowMs": 3600000
+    }
+  }
+}
+```
+
+`max` and `windowMs` are the operator's quota (here, 5 starts per hour, as in the Timon documentation example). A signed plugin is approved by its signature and stays subject to the quota.
+
+## Endpoint
 
 `POST /api/plugins/timon-mcp/mcp`
 
-JSON-RPC 2.0, une seule requête par appel, réponse `application/json`. Pas de flux SSE, pas de session. `Mcp-Session-Id` est facultatif et ignoré. Les révisions parlées sont `2025-06-18` et `2025-03-26`. Une version inconnue à l'initialisation reçoit la plus récente. Un en-tête `MCP-Protocol-Version` présent et inconnu répond `400`.
+JSON-RPC 2.0, one request per call, response `application/json`. No SSE stream, no session. `Mcp-Session-Id` is optional and ignored. The spoken revisions are `2025-06-18` and `2025-03-26`. An unknown version at initialization receives the latest. A present and unknown `MCP-Protocol-Version` header answers `400`.
 
-`GET /mcp` et `DELETE /mcp` répondent `405` si le handler est atteint. Sur le daemon, ces méthodes ne sont pas des chemins publics : un client anonyme reçoit `401` avant le handler.
+`GET /mcp` and `DELETE /mcp` answer `405` when the handler is reached. On the daemon those methods are not public paths: an anonymous client receives `401` before the handler.
 
-Le manifeste déclare sept chemins publics (`http:public`), au plus dix. Le daemon limite chacun : 60 requêtes par minute et par adresse, corps de 64 Ko, `POST` cross-site refusé. Un `Origin` d'un autre hôte est refusé (`403`) après l'authentification. Si `Host` porte un port, le port de l'`Origin` (écrit ou implicite) doit être le même. Si `Host` n'en porte pas, une `Origin` du même hôte sans port est acceptée en http comme en https : derrière TLS, le daemon voit souvent `Host: example.com` et `Origin: https://example.com`. Un client non navigateur, sans `Origin`, est accepté. Un lot JSON-RPC (tableau) est refusé.
+The manifest declares seven public paths (`http:public`), at most ten. The daemon limits each one: 60 requests a minute per address, a 64 KiB body, and a cross-site `POST` is refused. An `Origin` from another host is refused (`403`) after authentication. When `Host` carries a port, the `Origin` port (written or implicit) must be the same. When `Host` carries none, an `Origin` of the same host with no port is accepted over http and over https: behind TLS the daemon often sees `Host: example.com` and `Origin: https://example.com`. A non-browser client, with no `Origin`, is accepted. A JSON-RPC batch (an array) is refused.
 
-`GET /health` répond `{ "ok": true, "id": "timon-mcp" }`. Cette route n'est pas publique : elle suit la session du daemon.
+`GET /health` answers `{ "ok": true, "id": "timon-mcp" }`. This route is not public: it follows the daemon session.
 
-## Authentification
+## Authentication
 
-Le plugin est à la fois la ressource protégée et le serveur d'autorisation (MCP authorization, révision 2025-06-18). Les chemins n'ont pas de point : un segment de `routes.publicPaths` n'en accepte pas. Les URL `/.well-known/…` sont des réécritures du frontal, plus bas. Elles ne sont pas servies par le plugin.
+The plugin is both the protected resource and the authorization server (MCP authorization, revision 2025-06-18). Paths have no dot: a segment of `routes.publicPaths` cannot contain one. The `/.well-known/…` URLs are rewrites of the reverse proxy, below. The plugin does not serve them.
 
-| Méthode | Chemin | Rôle |
+| Method | Path | Role |
 | --- | --- | --- |
-| `GET` | `/oauth/protected-resource` | Métadonnées de ressource (RFC 9728). `resource` est l'adresse publique du point MCP. `authorization_servers` contient l'émetteur. |
-| `GET` | `/oauth/authorization-server` | Métadonnées du serveur d'autorisation (RFC 8414). PKCE `S256` seulement, grants `authorization_code` et `refresh_token`, authentification client `none`, `registration_endpoint` annoncé. |
-| `POST` | `/oauth/register` | Enregistrement dynamique (RFC 7591). Clients publics seulement. Aucun `client_secret`. |
-| `GET` | `/oauth/authorize` | Page de consentement, HTML autonome, jeton CSRF côté serveur. |
-| `POST` | `/oauth/authorize` | Décision. Un accord délivre un code à usage unique, 60 secondes au plus. |
-| `POST` | `/oauth/token` | Échange du code (PKCE S256) ou rotation du refresh token (RFC 6749, corps formulaire ou JSON). |
-| `POST` | `/mcp` | Point MCP. `Authorization: Bearer`. |
+| `GET` | `/oauth/protected-resource` | Protected-resource metadata (RFC 9728). `resource` is the public address of the MCP endpoint. `authorization_servers` contains the issuer. |
+| `GET` | `/oauth/authorization-server` | Authorization-server metadata (RFC 8414). PKCE `S256` only, grants `authorization_code` and `refresh_token`, client authentication `none`, `registration_endpoint` advertised. |
+| `POST` | `/oauth/register` | Dynamic client registration (RFC 7591). Public clients only. No `client_secret`. |
+| `GET` | `/oauth/authorize` | Consent page, self-contained HTML, server-side CSRF token. |
+| `POST` | `/oauth/authorize` | Decision. An approval issues a single-use code, at most 60 seconds. |
+| `POST` | `/oauth/token` | Code exchange (PKCE S256) or refresh-token rotation (RFC 6749, form body or JSON). |
+| `POST` | `/mcp` | MCP endpoint. `Authorization: Bearer`. |
 
-Tant que `public_url`, `issuer` ou `resource` manque ou n'est pas une URL `http`/`https` absolue, sans utilisateur, requête ni fragment, ces routes répondent `503` avec `error: not_configured`. La page d'autorisation est alors un HTML qui ne délivre pas de code. Aucun hôte n'est codé en dur.
+OAuth 2.1 here is dynamic client registration plus PKCE S256. `code_challenge_method=plain` is refused.
 
-`resource` (RFC 8707) est obligatoire à l'autorisation et à l'échange. Il doit être exactement l'adresse configurée. Un jeton émis pour une autre adresse est refusé au point MCP.
+While `public_url`, `issuer`, or `resource` is missing or is not an absolute `http`/`https` URL, with no userinfo, query, or fragment, these routes answer `503` with `error: not_configured`. The authorization page is then HTML that issues no code. No host is hard-coded.
 
-Sans en-tête `Authorization`, `POST /mcp` répond `401` :
+`resource` (RFC 8707) is required at authorization and at the exchange. It must be exactly the configured address. A token issued for another address is refused at the MCP endpoint.
+
+Without an `Authorization` header, `POST /mcp` answers `401`:
 
 ```http
 WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource"
 ```
 
-Un jeton présent mais inutilisable, inconnu, expiré ou d'une autre audience ajoute `, error="invalid_token"`. Le corps JSON reste `{ "error": "unauthorized", "message": "…" }`. Le jeton n'y figure pas. Un jeton dans la query string est ignoré. Le schéma `Bearer` ignore la casse. Au-delà de 512 caractères, la valeur présentée est refusée.
+A token that is present but unusable, unknown, expired, or for another audience adds `, error="invalid_token"`. The JSON body stays `{ "error": "unauthorized", "message": "…" }`. The token is not in it. A token in the query string is ignored. The `Bearer` scheme is case-insensitive. Past 512 characters, the presented value is refused.
 
-Le jeton d'accès est opaque, 15 minutes. Le refresh token dure 30 jours, tourne à chaque usage, et se révoque. Présenter un refresh déjà tourné révoque toute sa famille, y compris le jeton qui l'a remplacé et les accès encore en cours de cette famille. Jusqu'à cette réutilisation, l'accès précédent reste valable jusqu'à son expiration. Le code d'autorisation est retiré à la première présentation, même si le vérificateur PKCE est faux.
+The access token is opaque and lasts 15 minutes. The refresh token lasts 30 days, rotates on every use, and can be revoked. Presenting a refresh token that has already rotated revokes its whole family, including the token that replaced it and the access tokens of that family that are still in flight. Until that reuse, the previous access token stays valid until it expires. The authorization code is removed on first presentation, even when the PKCE verifier is wrong.
 
-`redirect_uri` doit être `https`, ou `http` limité à `localhost` et `127.0.0.1` (les CLI). `http://localhost.evil.com` est refusé. L'URI est liée au client enregistré, comparaison exacte de la chaîne enregistrée. `code_challenge_method=plain` est refusé. Le nombre de clients dynamiques est borné à 128. Quand ce plafond est atteint, la même transaction retire les clients créés depuis plus de 24 heures qui n'ont plus aucune ligne vivante : pas de jeton non révoqué encore avant `expires_at`, pas de code, pas de demande de consentement. Le décompte est refait ensuite. L'enregistrement répond `403` seulement si le plafond tient encore.
+`redirect_uri` must be `https`, or `http` limited to `localhost` and `127.0.0.1` (local CLIs). `http://localhost.evil.com` is refused. The URI is bound to the registered client, by exact comparison of the registered string. Dynamic clients are capped at 128. When that cap is reached, the same transaction removes clients created more than 24 hours ago that hold no live row: no unrevoked token still before `expires_at`, no code, no consent request. The count is taken again afterwards. Registration answers `403` only when the cap still holds.
 
-La même suppression peut être lancée à la main sur la base du plugin. `cutoff` est l'instant courant moins 24 heures, `now_ms` est l'instant courant, les deux en millisecondes Unix :
+The same removal can be run by hand on the plugin database. `cutoff` is the current time minus 24 hours, `now_ms` is the current time, both in Unix milliseconds:
 
 ```sql
 DELETE FROM oauth_clients
@@ -59,64 +101,64 @@ WHERE created_at < :cutoff
   AND client_id NOT IN (SELECT client_id FROM oauth_requests);
 ```
 
-Les codes, les jetons et le secret CSRF ne sont enregistrés qu'en empreinte SHA-256. Le sujet est l'empreinte de l'adresse, pas l'adresse. Les lignes expirées sont purgées. Rien de tout cela n'est écrit dans les journaux. Le plugin n'y met que des phrases fixes (`oauth: client registered`, `oauth: code issued`, `oauth: tokens issued`, `oauth: refresh rotated`, `oauth: authorization refused`). Un échec inattendu s'écrit `oauth: request failed (<nom>)`, où `<nom>` est `error.name` (par exemple `TypeError`). Le message de l'erreur n'est pas journalisé.
+Codes, tokens, and the CSRF secret are stored only as SHA-256 digests. The subject is the digest of the address, not the address. Expired rows are purged. None of this is written to the logs. The plugin logs only fixed phrases (`oauth: client registered`, `oauth: code issued`, `oauth: tokens issued`, `oauth: refresh rotated`, `oauth: authorization refused`). An unexpected failure is logged as `oauth: request failed (<name>)`, where `<name>` is `error.name` (for example `TypeError`). The error message is not logged.
 
-## Réglages
+## Settings
 
-Permission `settings`. Les valeurs sont lues à chaque requête. Vides au départ, sauf le droit documentaire.
+Permission `settings`. Values are read on every request. Empty at the start, except the documentary right.
 
-| Clé | Rôle |
+| Key | Role |
 | --- | --- |
-| `public_url` | Origine publique du plugin, sans barre finale. Sert au défi `resource_metadata`. Exemple fictif : `https://mcp.example`. |
-| `issuer` | Émetteur OAuth, sans barre finale. Le plugin est le serveur d'autorisation. Souvent la même origine. |
-| `resource` | Adresse canonique du point MCP, valeur du paramètre `resource`. Exemple fictif : `https://mcp.example/mcp`. |
-| `identity_header` | En-tête lu uniquement sur `/oauth/authorize`. Tant que la valeur n'est pas enregistrée, ou qu'elle est enregistrée vide, le plugin utilise le nom livré avec lui, `x-ambactos-email`. Une valeur non vide le remplace. <!-- timon-check: nom livré de l'en-tête quand le réglage est vide --> |
-| `expected_right` | Nom du droit attendu sur la surface. Défaut `timon`. Documentaire : aucun en-tête de droit n'est lu. Il apparaît sur la page de refus. |
-| `email_allowlist` | Adresses autorisées, séparées par des virgules, des espaces ou des points-virgules. Vide : tout refuser. |
+| `public_url` | Public origin of the plugin, without a trailing slash. Used for the `resource_metadata` challenge. Fictitious example: `https://mcp.example`. |
+| `issuer` | OAuth issuer, without a trailing slash. The plugin is the authorization server. Often the same origin. |
+| `resource` | Canonical address of the MCP endpoint, the value of the `resource` parameter. Fictitious example: `https://mcp.example/mcp`. |
+| `identity_header` | Header read only on `/oauth/authorize`. While the value is not saved, or is saved blank, the plugin uses the name it ships with, `x-forwarded-email`. A non-empty value replaces it. |
+| `expected_right` | Name of the right expected on the surface. Default `timon`. Documentary: no right header is read. It appears on the refusal page. |
+| `email_allowlist` | Allowed addresses, separated by commas, spaces, or semicolons. Empty: refuse everyone. |
 
-## Secret du coffre
+## Vault secret
 
-Un seul secret, en lecture : `TIMON_MCP_BEARER_TOKEN`. C'est le jeton statique des CLI sur l'hôte. Le créer dans le coffre, puis :
+One secret, read only: `TIMON_MCP_BEARER_TOKEN`. It is the static token for CLIs on the host. Create it in the vault, then:
 
 ```bash
 timon secret grant TIMON_MCP_BEARER_TOKEN --scope agent:plugin:timon-mcp
 ```
 
-Sans grant, `ctx.secrets.get` renvoie vide : le jeton statique est désactivé, le plugin ne plante pas. La valeur est relue à chaque appel. La comparaison porte sur des empreintes SHA-256, en temps constant. Le nom est la constante partagée avec le manifeste, jamais un littéral dans l'appel.
+Without a grant, `ctx.secrets.get` returns empty: the static token is disabled, and the plugin does not crash. The value is read again on every call. The comparison is of SHA-256 digests, in constant time. The name is the constant shared with the manifest, never a literal in the call.
 
-Ce jeton n'est pas lié à une audience. Il ne remplace pas OAuth pour les clients qui découvrent le serveur par le défi `401`.
+This token is not bound to an audience. It does not replace OAuth for clients that discover the server from the `401` challenge.
 
-## Identité
+## Identity
 
-La passerelle est un reverse proxy à session (cookie, lien magique). Elle sert sa propre page de connexion, puis renvoie sur le chemin demandé, y compris `/oauth/authorize`. Elle applique le droit avant de proxifier : seules les adresses des comptes qui ont le droit de la surface passent.
+Put `/oauth/authorize` behind an authentication proxy (a session cookie, a magic link, or any equivalent). The proxy serves its own login page, then sends the browser back to the requested path, including `/oauth/authorize`. It applies the right before it proxies: only addresses of accounts that hold the right on the surface get through.
 
-Elle transmet à l'amont un seul en-tête, `x-ambactos-email`. <!-- timon-check: nom de l'en-tête transmis par la passerelle, contrat d'identité -->
+It forwards one header upstream. The default name is `x-forwarded-email`, the convention used by authentication proxies such as oauth2-proxy. Set `identity_header` when the proxy uses another name.
 
-Il n'y a pas d'en-tête de droit, de niveau, ni de marqueur interne ou externe. Le plugin n'en suppose aucun. `expected_right` n'est qu'un libellé.
+There is no header for a right, a level, or an internal or external marker. The plugin assumes none. `expected_right` is only a label.
 
-`IdentityResolver` (`lib/auth/identity.js`) répond `{ subject, email }` ou `null`. Le nom d'en-tête vient du réglage s'il est renseigné, sinon de la valeur livrée `x-ambactos-email`, y compris quand la valeur enregistrée est vide. <!-- timon-check: même nom livré, valeur par défaut du réglage vide --> Il refuse si l'en-tête est absent ou vide, ou si l'adresse n'est pas dans l'allowlist. Une allowlist vide refuse tout le monde. Le refus est une page HTML, sans redirection et sans code. L'adresse n'est pas affichée.
+`IdentityResolver` (`lib/auth/identity.js`) returns `{ subject, email }` or `null`. The header name comes from the setting when that value is non-empty, otherwise from the shipped default `x-forwarded-email`, including when the saved value is blank. It refuses a missing or empty header, and an address that is not on the allowlist. An empty allowlist refuses everyone. The refusal is an HTML page, with no redirect and no code. The address is not shown.
 
-L'en-tête n'est lu que sur `GET` et `POST /oauth/authorize`. Sur `/mcp` et sur les autres routes, il est ignoré : il ne tient pas lieu de jeton.
+The header is read only on `GET` and `POST /oauth/authorize`. On `/mcp` and on the other routes it is ignored: it does not stand in for a token.
 
-Le sujet enregistré avec le code et les jetons est l'empreinte SHA-256 de l'adresse normalisée (espaces retirés, minuscules). Les journaux ne contiennent pas l'adresse en clair.
+The subject stored with the code and the tokens is the SHA-256 digest of the normalized address (trimmed, lower case). The logs do not contain the address in clear text.
 
-### Modèle de menace
+### Threat model
 
-Le client, depuis l'extérieur, ne peut pas forger l'en-tête : le frontal le retire sur les chemins publics, puis la passerelle le pose après avoir vérifié la session. La ligne de retrait vise `x-ambactos-email`. <!-- timon-check: en-tête à vider en bordure avant que la passerelle ne le pose -->
+A client on the outside cannot forge the header. The edge strips it on the public paths, then the authentication proxy sets it after checking the session. The strip line targets `x-forwarded-email`, or the name saved in `identity_header` when that setting is non-empty.
 
-Tout processus local qui joint le daemon peut poser cet en-tête lui-même. C'est une limite acceptée sur l'hôte : le daemon n'est pas exposé directement.
+Any local process that can reach the daemon can set this header itself. That is an accepted limit on the host: the daemon is not exposed directly.
 
-L'allowlist est une défense en profondeur. La passerelle a déjà filtré le droit. Une liste vide n'accorde rien, même si un en-tête arrive.
+The allowlist is defense in depth. The proxy has already filtered the right. An empty list grants nothing, even if a header arrives.
 
-### Exposition, hors mandat
+### What the reverse proxy must pass through
 
-Les chemins publics d'ambactos-surface retirent `Authorization` et `Cookie`. <!-- timon-check: composant qui retire ces en-têtes sur les chemins publics -->
+A reverse proxy often strips `Authorization` and `Cookie` on public paths.
 
-Cela convient à `/oauth/token`, `/oauth/register` et aux métadonnées. Le consentement n'utilise pas de cookie : le jeton CSRF est dans le formulaire et son empreinte est en base. En revanche, `/mcp` a besoin d'un mode « public avec Authorization » pour que le jeton porteur arrive au plugin. Ce changement est côté passerelle, pas dans ce dépôt.
+That fits `/oauth/token`, `/oauth/register`, and the metadata documents. Consent does not use a cookie: the CSRF token is in the form and its digest is in the database. `/mcp` needs `Authorization` to reach the plugin, so that path must be public with the header forwarded. That change is on the proxy, not in this repository.
 
-## Réécritures prévues
+## Reverse proxy
 
-Le frontal, plus tard, réécrit les URL publiques vers le préfixe du plugin. Hôte fictif, rien n'est installé ici :
+Any TLS reverse proxy rewrites the public URLs onto the plugin prefix. `/.well-known/*` is not a plugin route: the proxy rewrites it. Fictitious host, nothing is installed by this repository:
 
 ```nginx
 proxy_set_header Host $host;
@@ -126,13 +168,13 @@ rewrite ^/oauth/(.*)$ /api/plugins/timon-mcp/oauth/$1 last;
 rewrite ^/mcp$ /api/plugins/timon-mcp/mcp last;
 ```
 
-Le daemon compare `Origin` à `Host`. `proxy_set_header Host $host;` transmet l'hôte public vu par le client. Sans cette ligne, le daemon verrait l'adresse amont et refuserait une `Origin` du même site. `/mcp` doit transmettre `Authorization` jusqu'au daemon. Les chemins publics vident l'en-tête d'identité avant la passerelle, comme dit plus haut. `proxy_pass` vers `http://<daemon>` reste un exemple : l'adresse réelle est un réglage de l'opérateur, pas une valeur du plugin.
+The daemon compares `Origin` with `Host`. `proxy_set_header Host $host;` forwards the public host the client saw. Without that line the daemon would see the upstream address and refuse an `Origin` of the same site. `/mcp` must forward `Authorization` through to the daemon. Public paths clear the identity header at the edge, before the authentication proxy sets it, as above. `proxy_pass` to the daemon is an operator setting, not a value of the plugin.
 
 ## Clients
 
-Les clients qui parlent OAuth (claude.ai, ChatGPT, Grok) partent du `401` et de `resource_metadata`, enregistrent un client public, puis font le flux code + PKCE S256. L'opérateur renseigne les trois URL, l'allowlist, et place la passerelle devant `/oauth/authorize`. Aucune valeur de jeton ne se met dans le dépôt.
+OAuth clients start from the `401` and from `resource_metadata`, register a public client, then run the authorization-code flow with PKCE S256. The operator fills in the three URLs and the allowlist, and places the authentication proxy in front of `/oauth/authorize`. No token value belongs in the repository.
 
-Les CLI sur l'hôte (Claude Code, Codex, Cursor) utilisent le jeton statique. Même forme, URL fictive :
+CLIs on the host use the static token. Same shape, fictitious URL:
 
 ```json
 {
@@ -148,66 +190,48 @@ Les CLI sur l'hôte (Claude Code, Codex, Cursor) utilisent le jeton statique. M�
 }
 ```
 
-`<TIMON_MCP_BEARER_TOKEN>` désigne le secret du coffre. Ce n'est pas une valeur à coller.
+`<TIMON_MCP_BEARER_TOKEN>` names the vault secret. It is not a value to paste.
 
-## Outils
+## Tools
 
-La liste est fermée. Un autre nom renvoie un résultat `isError` « outil inconnu », sans appel aux façades. Chaque schéma a `additionalProperties: false`.
+The list is closed. Another name returns an `isError` result, `unknown tool`, with no facade call. Every schema has `additionalProperties: false`.
 
-| Outil | Rôle |
+| Tool | Role |
 | --- | --- |
-| `ask_main` | Mandat au pilote. Sans `project`, l'agent est `_main`. Avec `project` (`^[a-z0-9][a-z0-9-]{0,39}$`), l'agent est `<project>.main`. Aucun autre nom d'agent. Sans `mission_id`, `missions.spawn({ agent, mission })`. Avec `mission_id`, `missions.send`. Réponse `{ mission_id, agent, status }`. Message limité à 20 000 caractères. |
-| `get_reply` | État de la mission et dernier message de l'agent, via `missions.get` (`missions:read`). |
-| `wait` | Même forme que `get_reply`, plus `done`. Attente côté serveur, 25 s par défaut, 50 s au plus. |
-| `list_missions` | Missions du plugin : `id`, `agent_name`, `status`, `title`, `started_at`, `ended_at`. Le prompt n'est pas renvoyé. |
-| `list_tasks` | Tâches visibles par le plugin, via `ctx.kanban`. La description n'est pas renvoyée. |
-| `create_task` | Tâche `chore` du projet, assignée à `<project>.main`. Pas de backend, de modèle, de pipeline ni de permission. |
+| `ask_main` | Mandate to the pilot. Without `project`, the agent is `_main`. With `project` (`^[a-z0-9][a-z0-9-]{0,39}$`), the agent is `<project>.main`. No other agent name. Without `mission_id`, `missions.spawn({ agent, mission })`. With `mission_id`, `missions.send`. Reply `{ mission_id, agent, status }`. Message limited to 20,000 characters. |
+| `get_reply` | Mission state and the agent's last message, through `missions.get` (`missions:read`). |
+| `wait` | Same shape as `get_reply`, plus `done`. Server-side wait, 25 s by default, 50 s at most. |
+| `list_missions` | Missions of the plugin: `id`, `agent_name`, `status`, `title`, `started_at`, `ended_at`. The prompt is not returned. |
+| `list_tasks` | Tasks visible to the plugin, through `ctx.kanban`. The description is not returned. |
+| `create_task` | A `chore` task of the project, assigned to `<project>.main`. No backend, model, pipeline, or permission. |
 
-`spawn` n'envoie aucun override (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`).
+`spawn` sends no override (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`).
 
-`get_reply` ne déclare pas `missions:transcript`. Le corps du dernier message n'est renvoyé que s'il est déjà porté par la mission (`last_message` ou `messages`). Sinon la réponse contient le `summary` et l'état, et `message` vaut `null`.
+`get_reply` does not declare `missions:transcript`. The body of the last message is returned only when the mission already carries it (`last_message` or `messages`). Otherwise the reply contains the `summary` and the state, and `message` is `null`.
 
-`wait` s'appuie sur `ctx.events.on('turn_complete')` quand cet appel est disponible. La permission `events:subscribe` n'est pas déclarée : si l'appel lève, le plugin sonde l'état à intervalle court. `done` passe à `true` sur `turn_complete` pour cette mission, ou si le statut est terminal (`completed`, `failed`, `terminated`, `cancelled`). Une conversation encore ouverte reste `running` : le sondage du seul statut peut expirer avec `done: false`.
+`wait` uses `ctx.events.on('turn_complete')` when that call is available. The permission `events:subscribe` is not declared: if the call throws, the plugin polls the state at a short interval. `done` becomes `true` on `turn_complete` for this mission, or when the status is terminal (`completed`, `failed`, `terminated`, `cancelled`). A conversation that is still open stays `running`: polling the status alone can time out with `done: false`.
 
-Un refus de politique (`PluginPolicyError`, ou `reason: 'spawn_policy'`) est un résultat d'outil `isError`, avec le texte « en attente d'approbation de l'opérateur ». Ce n'est pas une erreur HTTP 500, et le plugin ne relance pas l'appel.
+A policy refusal (`PluginPolicyError`, or `reason: 'spawn_policy'`) is a tool result with `isError`, and the text `waiting for the operator's approval`. It is not an HTTP 500, and the plugin does not retry the call.
 
-## Identité des appels
+## Call identity
 
-Une route publique a un appelant anonyme. Dans ce contexte, `missions.send` est interdit et `missions.list` / `get` lisent toutes les missions. Chaque outil s'exécute donc hors de la requête, sous l'identité de tâche de fond `plugin:timon-mcp`, par la pompe démarrée dans `apply()` (`lib/mcp/job-runner.js`). Le plugin ne voit alors que les missions qu'il a lancées et les tâches qu'il a créées.
+A public route has an anonymous caller. In that context, `missions.send` is forbidden and `missions.list` / `get` read every mission. Each tool therefore runs outside the request, under the background task identity `plugin:timon-mcp`, through the pump started in `apply()` (`lib/mcp/job-runner.js`). The plugin then sees only the missions it started and the tasks it created.
 
 ## Permissions
 
 `http:public`, `missions:spawn`, `missions:read`, `missions:control`, `kanban:read`, `kanban:write`, `settings`, `secrets:read`, `storage:sql`.
 
-`missions:control` sert à `send`. Les outils n'exposent ni `kill`, ni `fork`, ni `stopScope`. `secrets:read` ne sert qu'au jeton statique. `storage:sql` ne sert qu'aux clients, codes et jetons OAuth. Aucun droit de configuration (`agents:*`, `mcp-servers:*`, `skills:*`, `secrets:manage`, `secrets:list`, `secrets:broker`, `admin`, `agents:privileged-config`).
+`missions:control` is for `send`. The tools expose neither `kill`, nor `fork`, nor `stopScope`. `secrets:read` is only for the static token. `storage:sql` is only for OAuth clients, codes, and tokens. No configuration right (`agents:*`, `mcp-servers:*`, `skills:*`, `secrets:manage`, `secrets:list`, `secrets:broker`, `admin`, `agents:privileged-config`).
 
-## Configuration opérateur
+## Tests
 
-Tant que le plugin n'est pas signé, `missions:spawn` est refusé tant que l'identifiant n'est pas approuvé. Les tâches créées depuis l'identité de fond passent par la même politique et le même quota. Dans `timon.config.json` :
-
-```json
-{
-  "pluginPolicy": {
-    "spawn": {
-      "approved": ["timon-mcp"],
-      "max": 5,
-      "windowMs": 3600000
-    }
-  }
-}
-```
-
-`max` et `windowMs` sont le quota de l'opérateur (ici 5 départs par heure, comme l'exemple de la documentation Timon). Un plugin signé est approuvé par sa signature et reste soumis au quota.
-
-## Prérequis et tests
-
-Node.js 22 ou plus récent. Aucune dépendance npm : le sous-ensemble stateless de MCP Streamable HTTP est un petit noyau JSON-RPC dans `lib/mcp/`. `@timon-ai/sdk` n'est pas publié. Les tests de contrat (`node:test`) suivent le contrat documenté du daemon et utilisent le faux contexte de `test/helpers/fake-ctx.js`. Le double SQL des tests s'appuie sur `node:sqlite` ; le plugin, lui, n'appelle que `ctx.sql`.
+No npm dependency: the stateless subset of MCP Streamable HTTP is a small JSON-RPC core in `lib/mcp/`. `@timon-ai/sdk` is not published. The contract tests (`node:test`) follow the documented daemon contract and use the fake context in `test/helpers/fake-ctx.js`. The SQL double in the tests uses `node:sqlite`. The plugin itself calls only `ctx.sql`.
 
 ```bash
 npm test
 ```
 
-Contrôle de distribution, depuis ce dossier :
+Distribution check, from this directory:
 
 ```bash
 timon plugin check .

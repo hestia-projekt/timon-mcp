@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { createResponse, createRouter } from './mini-router.js';
 
 /**
- * Store entered for the duration of an HTTP request. A façade call made from
+ * Store entered for the duration of an HTTP request. A facade call made from
  * the handler records this store. A call made from the plugin's job pump,
  * which was armed outside the request, records `null`.
  */
@@ -257,7 +257,7 @@ function createState(options) {
 }
 
 /**
- * Records the AsyncLocalStorage store active at each façade call.
+ * Records the AsyncLocalStorage store active at each facade call.
  * @param {object} state
  * @param {string} facade
  * @param {object} target

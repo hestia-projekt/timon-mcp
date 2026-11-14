@@ -1,6 +1,7 @@
 {
   "name": "@hestia-projekt/timon-mcp",
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "private": true,
   "description": "Host plugin that exposes a stateless Streamable HTTP MCP server. Clients mandate the pilot. POST /mcp requires a bearer token.",
   "type": "module",
@@ -41,18 +42,18 @@
       "storage:sql"
     ],
     "settings": [
-      { "key": "public_url", "type": "string", "label": "URL publique du plugin, sans barre finale" },
-      { "key": "issuer", "type": "string", "label": "Émetteur OAuth, sans barre finale" },
-      { "key": "resource", "type": "string", "label": "Adresse publique du point MCP (paramètre resource)" },
-      { "key": "identity_header", "type": "string", "label": "En-tête d'identité lu uniquement sur /oauth/authorize" },
-      { "key": "expected_right", "type": "string", "label": "Droit attendu, documentaire : aucun en-tête de droit n'est lu", "default": "timon" },
-      { "key": "email_allowlist", "type": "string", "label": "Adresses autorisées, séparées par des virgules. Vide : tout refuser" }
+      { "key": "public_url", "type": "string", "label": "Public URL of the plugin, without a trailing slash" },
+      { "key": "issuer", "type": "string", "label": "OAuth issuer, without a trailing slash" },
+      { "key": "resource", "type": "string", "label": "Public address of the MCP endpoint (resource parameter)" },
+      { "key": "identity_header", "type": "string", "label": "Identity header, read only on /oauth/authorize" },
+      { "key": "expected_right", "type": "string", "label": "Expected right, documentary: no right header is read", "default": "timon" },
+      { "key": "email_allowlist", "type": "string", "label": "Allowed addresses, separated by commas. Empty: refuse everyone" }
     ],
     "secrets": [
       {
         "name": "TIMON_MCP_BEARER_TOKEN",
         "mode": "read",
-        "why": "Jeton porteur statique des CLI locales. Accordé au plugin, jamais écrit dans le dépôt."
+        "why": "Static bearer token for local CLIs. Granted to the plugin, never written in the repository."
       }
     ],
     "migrations": "migrations",
