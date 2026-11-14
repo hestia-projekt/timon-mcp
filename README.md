@@ -12,7 +12,7 @@ JSON-RPC 2.0, une seule requête par appel, réponse `application/json`. Pas de 
 
 `GET /mcp` et `DELETE /mcp` répondent `405` si le handler est atteint. Sur le daemon, ces méthodes ne sont pas des chemins publics : un client anonyme reçoit `401` avant le handler.
 
-Le manifeste déclare uniquement `POST /mcp` dans `routes.publicPaths` (`http:public`). Le daemon limite ce chemin : 60 requêtes par minute et par adresse, corps de 64 Ko, `POST` cross-site refusé. Un `Origin` d'un autre hôte ou port est refusé (`403`). Un client non navigateur, sans `Origin`, est accepté. Un lot JSON-RPC (tableau) est refusé.
+Le manifeste déclare uniquement `POST /mcp` dans `routes.publicPaths` (`http:public`). Le daemon limite ce chemin : 60 requêtes par minute et par adresse, corps de 64 Ko, `POST` cross-site refusé. Un `Origin` d'un autre hôte est refusé (`403`). Si `Host` porte un port, le port de l'`Origin` (écrit ou implicite) doit être le même. Si `Host` n'en porte pas, une `Origin` du même hôte sans port est acceptée en http comme en https : derrière TLS, le daemon voit souvent `Host: example.com` et `Origin: https://example.com`. Un client non navigateur, sans `Origin`, est accepté. Un lot JSON-RPC (tableau) est refusé.
 
 `GET /health` répond `{ "ok": true, "id": "timon-mcp" }`.
 
