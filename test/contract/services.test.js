@@ -31,6 +31,21 @@ test('missions and kanban facades keep caller-supplied records', async (t) => {
   );
 });
 
+test('fake ctx rejects invalid JSON', async (t) => {
+  const { baseUrl, close } = await createFakeCtx({ id: 'timon-mcp' });
+  t.after(() => close());
+  const invalid = await fetch(`${baseUrl}/api/plugins/timon-mcp/health`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{',
+  });
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(await invalid.json(), {
+    error: 'invalid_json',
+    message: 'Request body is not valid JSON',
+  });
+});
+
 test('secrets come from the values supplied at runtime', async (t) => {
   const name = `name-${randomUUID()}`;
   const value = randomUUID();

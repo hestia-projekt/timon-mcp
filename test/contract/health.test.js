@@ -48,17 +48,20 @@ test('predictable failures on /health are JSON', async (t) => {
   const missingBody = await missing.json();
   assert.equal(missingBody.error, 'not_found');
   assert.match(missingBody.message, /No route for GET \/missing/);
+});
 
-  const invalid = await fetch(`${root}/health`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: '{',
+test('the plugin 404 does not swallow the reserved /- / prefix', async (t) => {
+  const { ctx, baseUrl, close } = await createFakeCtx({ id: PLUGIN_ID });
+  t.after(() => close());
+  apply(ctx);
+  const later = ctx.router();
+  later.get('/-/x', (_req, res) => {
+    res.status(200).json({ reserved: true });
   });
-  assert.equal(invalid.status, 400);
-  assert.deepEqual(await invalid.json(), {
-    error: 'invalid_json',
-    message: 'Request body is not valid JSON',
-  });
+
+  const response = await fetch(`${baseUrl}/api/plugins/${PLUGIN_ID}/-/x`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { reserved: true });
 });
 
 test('apply rejects a context without a router', () => {
@@ -73,7 +76,7 @@ test('apply rejects a context without a router', () => {
   });
 });
 
-test('mission and policy errors carry their code', () => {
+test('mission errors carry a code and policy errors carry a rule', () => {
   const mission = new PluginMissionError('not_found', 'mission not found');
   assert.equal(mission.name, 'PluginMissionError');
   assert.equal(mission.code, 'not_found');
@@ -83,6 +86,6 @@ test('mission and policy errors carry their code', () => {
   assert.equal(policy.name, 'PluginPolicyError');
   assert.equal(policy.pluginId, 'timon-mcp');
   assert.equal(policy.rule, 'spawn');
-  assert.equal(policy.code, 'spawn');
+  assert.equal(policy.code, undefined);
   assert.match(policy.message, /quota exceeded/);
 });

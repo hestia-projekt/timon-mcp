@@ -48,8 +48,6 @@ export class PluginPolicyError extends Error {
     this.name = 'PluginPolicyError';
     this.pluginId = pluginId;
     this.rule = rule;
-    // The daemon exposes `rule`. `code` mirrors it so callers branch once.
-    this.code = rule;
   }
 }
 
@@ -116,6 +114,16 @@ export async function createFakeCtx(options = {}) {
       }
       if (response.headersSent) return;
       if (pending) {
+        // Body-parser failures are raised by this double (`invalid_json`,
+        // `body_too_large`). They are not a behavior of the plugin.
+        const described = httpErrorOf(pending);
+        if (described) {
+          response.status(described.status).json({
+            error: described.error,
+            message: described.message,
+          });
+          return;
+        }
         response.status(500).json({ error: 'internal_error' });
         return;
       }
@@ -585,6 +593,20 @@ function readRaw(incoming) {
       if (!failed) reject(error);
     });
   });
+}
+
+/**
+ * @param {unknown} error
+ * @returns {{ status: number, error: string, message: string } | null}
+ */
+function httpErrorOf(error) {
+  if (!error || typeof error !== 'object') return null;
+  const record = /** @type {{ status?: unknown, code?: unknown, message?: unknown }} */ (error);
+  const status = Number(record.status);
+  if (!Number.isInteger(status) || status < 400 || status > 599) return null;
+  if (typeof record.code !== 'string' || !record.code) return null;
+  const message = typeof record.message === 'string' && record.message ? record.message : record.code;
+  return { status, error: record.code, message };
 }
 
 /**
