@@ -15,7 +15,7 @@ Les deux commandes doivent réussir avant une PR :
 
 ## Invariants
 
-- Le manifeste déclare `id` `timon-mcp`, `apiVersion` 15, `kind` `behavior`. Les permissions sont exactement `http:public`, `missions:spawn`, `missions:read`, `missions:control`, `kanban:read`, `kanban:write`. Chaque étape suivante n'ajoute que les permissions qu'elle utilise.
+- Le manifeste déclare `id` `timon-mcp`, `apiVersion` 15, `kind` `behavior`. Les permissions sont exactement `http:public`, `missions:spawn`, `missions:read`, `missions:control`, `kanban:read`, `kanban:write`, `settings`, `secrets:read`, `storage:sql`. Chaque étape suivante n'ajoute que les permissions qu'elle utilise.
 - Aucun outil ne change la configuration des agents, des serveurs MCP, des skills ou des secrets. Permissions interdites : `agents:privileged-config`, tout droit `agents:*`, `mcp-servers:*`, `skills:*`, `secrets:manage`, `secrets:list`, `secrets:broker`, `admin`.
 - Aucun secret dans le dépôt, les tests ou les journaux. Une valeur de test est produite à l'exécution.
 - Aucun chemin absolu de machine. Construire les chemins avec `node:path`.

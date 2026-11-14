@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
-import { authenticate } from '../../lib/auth/index.js';
 import { apply } from '../../lib/index.js';
-import { APPROVAL_MESSAGE } from '../../lib/constants.js';
+import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
 import {
   createFakeCtx,
   PluginMissionError,
@@ -13,14 +12,9 @@ import {
 } from '../helpers/fake-ctx.js';
 
 const PLUGIN = 'timon-mcp';
-
-test('authenticate is a pass-through until step 3', () => {
-  const source = readFileSync(new URL('../../lib/auth/index.js', import.meta.url), 'utf8');
-  assert.match(source, /TODO\(étape 3\)/);
-  assert.deepEqual(authenticate({ headers: {} }), { ok: true });
-  assert.equal(authenticate({ headers: {}, get() { return undefined; } }).ok, true);
-  assert.equal(authenticate(null).ok, false);
-});
+const BEARER = randomBytes(32).toString('base64url');
+const PUBLIC = 'https://mcp.example';
+const CHALLENGE = `Bearer resource_metadata="${PUBLIC}/.well-known/oauth-protected-resource"`;
 
 test('initialize negotiates a supported version and answers an unknown one with the latest', async (t) => {
   const ctx = await open(t);
@@ -75,15 +69,17 @@ test('notifications get an empty 202, and GET or DELETE are refused', async (t) 
   assert.equal(batch.json.error.code, -32600);
 });
 
-test('a request without a token is accepted', async (t) => {
+test('a request without a token is rejected', async (t) => {
   const ctx = await open(t);
   const response = await fetch(`${ctx.baseUrl}/api/plugins/${PLUGIN}/mcp`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
     body: JSON.stringify(rpc('ping')),
   });
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('www-authenticate'), null);
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get('www-authenticate'), CHALLENGE);
+  const body = await response.json();
+  assert.deepEqual(body, { error: 'unauthorized', message: 'authentication required' });
 });
 
 test('tools/list returns exactly the six tools, each with a strict schema', async (t) => {
@@ -363,7 +359,15 @@ test('wait completes when turn_complete fires', async (t) => {
  * @param {import('node:test').TestContext} t
  */
 async function open(t) {
-  const opened = await createFakeCtx({ id: PLUGIN });
+  const opened = await createFakeCtx({
+    id: PLUGIN,
+    secrets: { [BEARER_SECRET]: BEARER },
+    settings: {
+      public_url: PUBLIC,
+      issuer: PUBLIC,
+      resource: `${PUBLIC}/mcp`,
+    },
+  });
   t.after(() => opened.close());
   apply(opened.ctx);
   return Object.assign(opened, {
@@ -378,13 +382,21 @@ async function open(t) {
  * @param {Record<string, string>} [headers]
  */
 async function post(ctx, body, headers = {}) {
+  const extra = { ...headers };
+  let authorization = `Bearer ${BEARER}`;
+  if (Object.prototype.hasOwnProperty.call(extra, 'authorization')) {
+    authorization = extra.authorization;
+    delete extra.authorization;
+  }
+  const sent = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    ...extra,
+  };
+  if (authorization) sent.authorization = authorization;
   const response = await fetch(`${ctx.baseUrl}/api/plugins/${PLUGIN}/mcp`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json, text/event-stream',
-      ...headers,
-    },
+    headers: sent,
     body: JSON.stringify(body),
   });
   const text = await response.text();
