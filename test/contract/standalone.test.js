@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
+import { APPROVAL_MESSAGE, BEARER_SECRET, WAIT_MAX_S } from '../../lib/constants.js';
 import { DAEMON_ROUTES, createDaemonClient } from '../../host/daemon.js';
 import { clientAddress, startStandalone } from '../../host/standalone.js';
 import { startFakeDaemon } from '../helpers/fake-daemon.js';
@@ -720,6 +720,16 @@ test('every early refusal closes a stalled body', async (t) => {
     headers: { 'x-real-ip': '203.0.113.90' },
   });
   assert.equal(after.status, 503);
+});
+
+test('the socket idle timeout outlasts the longest wait', async (t) => {
+  const stack = await openStack(t, { daemon: false });
+  const floor = (WAIT_MAX_S + 20) * 1000;
+  assert.equal(typeof stack.host.socketTimeoutMs, 'number');
+  assert.ok(stack.host.socketTimeoutMs >= floor, String(stack.host.socketTimeoutMs));
+  // 70s is the legal silence. 75s forces a margin so the idle timer cannot
+  // fire on the same tick as the daemon call that follows `wait`.
+  assert.ok(stack.host.socketTimeoutMs >= 75_000, String(stack.host.socketTimeoutMs));
 });
 
 test('slow headers are closed by the server timeout', async (t) => {

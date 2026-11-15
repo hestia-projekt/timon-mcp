@@ -2,12 +2,21 @@
  * Process entry for the standalone host. Importing this file does not listen.
  * The checkout keeps `bin/`, `host/` and `lib/` together: the imports are
  * resolved from this file, not from the working directory.
+ *
+ * The version check runs before `host/standalone.js` is loaded. A static
+ * import would pull in `node:sqlite` first and fail with Node's own error
+ * on every release before 22.13.
  */
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { startStandalone } from '../host/standalone.js';
+import { nodeSupportsSqlite, standaloneNodeMessage } from '../host/node-version.js';
 
 if (isDirectRun()) {
+  if (!nodeSupportsSqlite(process.versions.node)) {
+    process.stderr.write(`${standaloneNodeMessage(process.versions.node)}\n`);
+    process.exit(1);
+  }
+  const { startStandalone } = await import('../host/standalone.js');
   startStandalone().then((host) => {
     process.stdout.write(`timon-mcp standalone listening on 127.0.0.1:${host.port}\n`);
     let stopping = false;

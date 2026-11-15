@@ -95,7 +95,7 @@ test('package is the private ESM entry point', () => {
   assert.equal(pkg.private, true);
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.main, 'lib/index.js');
-  assert.equal(pkg.engines.node, '>=22');
+  assert.equal(pkg.engines.node, '>=22.13');
   assert.equal(pkg.scripts.test, 'node --test');
 });
 

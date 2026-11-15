@@ -16,10 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Require Node.js 22
+          node-version: '22.13'
+      - name: Require Node.js 22.13
         run: |
           node --version
-          node -e 'const major = Number(process.versions.node.split(".")[0]); if (!(major >= 22)) { console.error("Node.js 22 or newer is required, got " + process.version); process.exit(1); }'
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 13)) { console.error("Node.js 22.13 or newer is required, got " + process.version); process.exit(1); }'
       - run: npm ci
       - run: npm test

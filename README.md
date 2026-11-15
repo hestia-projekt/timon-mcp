@@ -8,7 +8,7 @@ Licensed under the GNU Affero General Public License v3.0 only. See `LICENSE`.
 
 ## Install
 
-Node.js 22 or newer. From this directory, or from a packed archive:
+Node.js 22.13 or newer. From this directory, or from a packed archive:
 
 ```bash
 timon plugin add .
@@ -228,7 +228,7 @@ A public route has an anonymous caller. In that context, `missions.send` is forb
 
 This mode runs the same plugin without loading it into the daemon. It is provisional. While a release refuses an unsigned plugin, a small host can serve the routes itself. When a later release loads the plugin, point the reverse proxy back at the daemon. One `proxy_pass` line switches to the host, and the same line pointed at the daemon restores the plugin. The paths stay `/api/plugins/timon-mcp/…`.
 
-The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js 22 or newer and has no npm dependency. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
+The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js 22.13 or newer, because `node:sqlite` is only a stable built-in from that release, and has no npm dependency. The process checks the version before it loads that module: an older Node exits with a message on stderr and a non-zero status. The daemon 0.1.7 ships Node 22.23.4, so installing the plugin into the daemon is unchanged. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
 
 The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
 
@@ -240,7 +240,7 @@ In this mode `summary` is null. The mission route used here does not carry one.
 
 Public paths keep the daemon limits: 60 requests a minute per address, a body of at most 64 KiB, and a cross-site POST is refused. The address is the socket peer. `X-Real-IP` is used only when `TIMON_MCP_TRUST_PROXY=1` and that peer is loopback, which is how the reverse proxy on this machine reaches the host. The proxy must set `proxy_set_header X-Real-IP $remote_addr;`. Any other value of the setting, or a peer that is not loopback, ignores the header. `X-Forwarded-For` is ignored. `GET /health` is not a public path.
 
-Any response sent before that body has been read leaves through one exit: `Connection: close`, then at most 1 MiB of the unread body is discarded over at most 5 seconds, then the socket is destroyed. That covers a non-public path, an unknown prefix, a method this host does not serve, a cross-site POST, a body past 64 KiB, a rate limit, and any later status written while the body is still unread. The server also stops incomplete headers after 10 seconds and an unfinished request after 30 seconds. An idle socket is closed after 30 seconds. Incomplete requests are checked every second, so those deadlines fire on time.
+Any response sent before that body has been read leaves through one exit: `Connection: close`, then at most 1 MiB of the unread body is discarded over at most 5 seconds, then the socket is destroyed. That covers a non-public path, an unknown prefix, a method this host does not serve, a cross-site POST, a body past 64 KiB, a rate limit, and any later status written while the body is still unread. The server also stops incomplete headers after 10 seconds and an unfinished request after 30 seconds. An idle socket is closed after 80 seconds: the longest `wait` is 50 seconds and writes nothing, the following daemon call is capped at 20 seconds, and 10 seconds of margin keep that call from losing the socket. Incomplete requests are checked every second, so those deadlines fire on time.
 
 An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=` and contains no secret. The operator replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together) and installs the unit. This package does not install it.
 

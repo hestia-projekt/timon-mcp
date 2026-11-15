@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { BEARER_SECRET, PLUGIN_ID } from '../lib/constants.js';
+import { BEARER_SECRET, PLUGIN_ID, WAIT_MAX_S } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
 import { createDaemonClient, resolveDaemonOrigin } from './daemon.js';
 import { createMissionFacade, createSpawnQuota, createTaskFacade } from './facades.js';
@@ -24,14 +24,27 @@ const DRAIN_MAX_MS = 5_000;
 /**
  * Defense in depth, outside `refuseEarly`. A slow header cannot outlive
  * `HEADERS_TIMEOUT_MS`. A request that stalls after the headers cannot outlive
- * `REQUEST_TIMEOUT_MS`. `SOCKET_TIMEOUT_MS` is inactivity on the socket, so a
- * slow read is still bounded once the handler has started. Incomplete requests
- * are checked every `CONNECTIONS_CHECK_MS`, which is what makes the two
- * request deadlines fire on time.
+ * `REQUEST_TIMEOUT_MS`. Those two stop once the request has been received.
+ * They do not cut a response that is slow to produce.
+ *
+ * `SOCKET_TIMEOUT_MS` is inactivity on the socket (`server.timeout`). With no
+ * `timeout` listener, Node destroys the socket when it elapses, in either
+ * direction. `wait` writes nothing for up to `WAIT_MAX_S` seconds. The
+ * handler can then call the daemon, which is capped at 20 seconds by
+ * `AbortSignal.timeout(20_000)` in `host/daemon.js`. The idle limit is that
+ * sum plus `SOCKET_TIMEOUT_MARGIN_MS`, so a legal `wait` (31 to 50 seconds,
+ * including the 25 second default followed by a slow daemon read) returns
+ * JSON instead of `ECONNRESET`. A slow read is still bounded. Incomplete
+ * requests are checked every `CONNECTIONS_CHECK_MS`, which is what makes
+ * the header and request deadlines fire on time.
  */
 const HEADERS_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
-const SOCKET_TIMEOUT_MS = 30_000;
+/** Seconds. Same budget as `AbortSignal.timeout(20_000)` in `host/daemon.js`. */
+const DAEMON_CALL_TIMEOUT_S = 20;
+/** Slack so the idle timer cannot fire on the same tick as that budget. */
+const SOCKET_TIMEOUT_MARGIN_MS = 10_000;
+const SOCKET_TIMEOUT_MS = (WAIT_MAX_S + DAEMON_CALL_TIMEOUT_S) * 1000 + SOCKET_TIMEOUT_MARGIN_MS;
 const CONNECTIONS_CHECK_MS = 1_000;
 /** Methods this host will route. Any other method is a 405 before the body is read. */
 const SERVED_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT']);
@@ -232,6 +245,7 @@ export async function startStandalone(options = {}) {
     ctx,
     journal,
     bodyBytesRetained() { return retained.bytes; },
+    socketTimeoutMs: server.timeout,
   };
 }
 
@@ -977,6 +991,8 @@ function installResponseGuard(raw) {
 function armEarlyClose(raw, incoming) {
   if (raw[kArmed]) return;
   raw[kArmed] = true;
+  // `writeHead` before `end` would send the status line without this header.
+  if (!raw.headersSent) raw.setHeader('connection', 'close');
   const originalEnd = raw[kOriginalEnd] || raw.end;
   const drop = discardIncoming(incoming);
   raw.end = function end(chunk, encoding, cb) {
