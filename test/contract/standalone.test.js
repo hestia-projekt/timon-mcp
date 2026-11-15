@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -397,8 +398,11 @@ test('list reads at most the 50 newest ids and forgets a 404', async (t) => {
     insertTask.run(`t${String(i).padStart(3, '0')}`, 'alpha', 'alpha.main', 't', i + 1);
   }
   const before = stack.daemon.requests.length;
+  const readsAt = stack.host.ctx.sql.readCounts.length;
   const missions = await stack.host.ctx.missions.list();
   const tasks = await stack.host.ctx.kanban.list();
+  const readRows = stack.host.ctx.sql.readCounts.slice(readsAt);
+  assert.deepEqual(readRows, [50, 50]);
   const gets = stack.daemon.requests.slice(before).filter((row) => row.method === 'GET');
   assert.equal(missions.length, 0);
   assert.equal(tasks.length, 0);
@@ -479,6 +483,100 @@ test('a declared oversized body is refused without reading it', async (t) => {
   });
   assert.equal(result.status, 413);
   assert.equal(result.json.code, 'payload_too_large');
+  assert.equal(stack.host.bodyBytesRetained(), 0);
+});
+
+test('a POST of 65537 bytes receives the JSON 413', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
+  const body = Buffer.alloc(65537, 0x61);
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for 413')), 1500);
+    const req = httpRequest({
+      hostname: '127.0.0.1',
+      port: stack.host.port,
+      path: `${PREFIX}/mcp`,
+      method: 'POST',
+      agent: false,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(body.length),
+        'x-real-ip': '203.0.113.78',
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        clearTimeout(timer);
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+        resolve({ status: res.statusCode, headers: res.headers, json, text });
+      });
+    });
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    req.end(body);
+  });
+  assert.equal(result.status, 413);
+  assert.equal(result.json.code, 'payload_too_large');
+  assert.equal(result.headers.connection, 'close');
+  assert.equal(result.text.includes('aaaaaaa'), false);
+  assert.equal(stack.host.bodyBytesRetained(), 0);
+});
+
+test('a body past the drain budget closes the socket and is not stored', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
+  const marker = 'PAYLOAD-MARKER-7f3a';
+  const declared = (1024 * 1024) + (256 * 1024);
+  const piece = Buffer.concat([Buffer.from(marker), Buffer.alloc(32 * 1024, 0x62)]);
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for the close')), 3000);
+    const socket = netConnect(stack.host.port, '127.0.0.1');
+    let written = 0;
+    let retainedDuring = 0;
+    let code = null;
+    const finish = () => {
+      clearTimeout(timer);
+      resolve({
+        code,
+        written,
+        retainedDuring,
+        retained: stack.host.bodyBytesRetained(),
+      });
+    };
+    socket.on('error', (err) => { code = err.code; });
+    socket.on('close', finish);
+    socket.on('connect', () => {
+      socket.write([
+        `POST ${PREFIX}/mcp HTTP/1.1`,
+        'Host: 127.0.0.1',
+        'Content-Type: application/json',
+        `Content-Length: ${declared}`,
+        '',
+        '',
+      ].join('\r\n'));
+      const pump = () => {
+        if (socket.destroyed) return;
+        while (written < declared) {
+          retainedDuring = Math.max(retainedDuring, stack.host.bodyBytesRetained());
+          const ok = socket.write(piece);
+          written += piece.length;
+          if (!ok) {
+            socket.once('drain', pump);
+            return;
+          }
+        }
+      };
+      pump();
+    });
+  });
+  assert.ok(result.code === 'ECONNRESET' || result.code === 'EPIPE' || result.code === 'ECONNABORTED', result.code);
+  assert.equal(result.retainedDuring, 0);
+  assert.equal(result.retained, 0);
+  const dumped = JSON.stringify(stack.logs) + JSON.stringify(stack.journal);
+  assert.equal(dumped.includes(marker), false);
 });
 
 test('X-Real-IP is ignored unless the peer is a trusted loopback proxy', async (t) => {
@@ -568,7 +666,18 @@ test('migrations apply once and the state file reopens', async (t) => {
   });
   t.after(() => again.close());
   const count = again.ctx.sql.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get();
-  assert.equal(Number(count.n), 1);
+  assert.equal(Number(count.n), 2);
+  const applied = again.ctx.sql.prepare('SELECT name FROM schema_migrations ORDER BY name').all().map((row) => row.name);
+  assert.deepEqual(applied, ['001-oauth.sql', '002-list-index.sql']);
+  const indexes = again.ctx.sql.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('host_missions', 'host_tasks')",
+  ).all().map((row) => row.name);
+  assert.ok(indexes.includes('host_missions_created'));
+  assert.ok(indexes.includes('host_tasks_created'));
+  const plan = again.ctx.sql.prepare(
+    'EXPLAIN QUERY PLAN SELECT id FROM host_missions ORDER BY created_at DESC, id DESC LIMIT ?',
+  ).all(50);
+  assert.match(JSON.stringify(plan), /host_missions_created/);
   await again.close();
   await again.close();
 });

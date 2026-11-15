@@ -16,7 +16,11 @@ import { createMissionFacade, createSpawnQuota, createTaskFacade } from './facad
 import { createResponse, createRouter } from './router.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const HOST_MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
 const PUBLIC_BODY_MAX = 64 * 1024;
+/** Bytes of an already-refused body that may be discarded before the socket is destroyed. */
+const DRAIN_MAX_BYTES = 1024 * 1024;
+const DRAIN_MAX_MS = 5_000;
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 60;
 const SETTING_KEYS = [
@@ -68,6 +72,8 @@ export async function startStandalone(options = {}) {
   /** @type {ReturnType<typeof createRouter>[]} */
   const routers = [];
   const buckets = new Map();
+  /** Body bytes currently held in memory. The oversized path must leave this at 0. */
+  const retained = { bytes: 0 };
   let closed = false;
 
   const ctx = {
@@ -134,6 +140,7 @@ export async function startStandalone(options = {}) {
       buckets,
       scrub: client.scrub,
       trustProxy,
+      retained,
     }).catch(() => {
       if (!raw.writableEnded) {
         try {
@@ -191,6 +198,7 @@ export async function startStandalone(options = {}) {
     logs,
     ctx,
     journal,
+    bodyBytesRetained() { return retained.bytes; },
   };
 }
 
@@ -287,6 +295,10 @@ function openState(file, migrationsDir) {
         created_at INTEGER NOT NULL
       );
     `);
+    // The plugin migrations are shared with the daemon, which has neither
+    // host table. The list indexes are a host migration and run after the
+    // tables exist.
+    applyMigrations(db, HOST_MIGRATIONS);
   } catch (err) {
     try { db?.close(); } catch { /* the open is what failed */ }
     const code = err && typeof err === 'object' && typeof err.code === 'string' && /^[A-Z0-9_]+$/.test(err.code)
@@ -330,7 +342,10 @@ function applyMigrations(db, migrationsDir) {
  * @param {import('node:sqlite').DatabaseSync} db
  */
 function createSql(db) {
+  /** Row counts materialized by `.all()`, in call order. */
+  const readCounts = [];
   return {
+    readCounts,
     /**
      * @param {string} statement
      */
@@ -342,7 +357,9 @@ function createSql(db) {
           return row === undefined ? undefined : row;
         },
         all(...params) {
-          return stmt.all(...params);
+          const rows = stmt.all(...params);
+          readCounts.push(rows.length);
+          return rows;
         },
         run(...params) {
           const result = stmt.run(...params);
@@ -422,9 +439,10 @@ function safeJson(value) {
  * @param {Map<string, { start: number, count: number }>} input.buckets
  * @param {(value: unknown) => unknown} input.scrub
  * @param {boolean} input.trustProxy
+ * @param {{ bytes: number }} input.retained
  */
 async function handleHttp(input) {
-  const { incoming, raw, prefix, publicPaths, routers, buckets, scrub, trustProxy } = input;
+  const { incoming, raw, prefix, publicPaths, routers, buckets, scrub, trustProxy, retained } = input;
   let url;
   try {
     url = new URL(incoming.url || '/', 'http://127.0.0.1');
@@ -449,9 +467,7 @@ async function handleHttp(input) {
   }
   const declared = declaredLength(incoming);
   if (declared !== null && declared > PUBLIC_BODY_MAX) {
-    sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub, undefined, () => {
-      incoming.destroy();
-    });
+    refuseOversized(raw, incoming, scrub);
     return;
   }
   const rate = takeRate(buckets, clientAddress(incoming, trustProxy), Date.now());
@@ -470,10 +486,10 @@ async function handleHttp(input) {
   if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
     let rawBody;
     try {
-      rawBody = await readLimited(incoming, PUBLIC_BODY_MAX);
+      rawBody = await readLimited(incoming, PUBLIC_BODY_MAX, retained);
     } catch (err) {
       if (err && typeof err === 'object' && err.code === 'payload_too_large') {
-        sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub);
+        refuseOversized(raw, incoming, scrub);
         return;
       }
       sendJson(raw, 400, { error: 'bad_request' }, scrub);
@@ -657,32 +673,142 @@ function takeRate(buckets, ip, now) {
 /**
  * @param {import('node:http').IncomingMessage} req
  * @param {number} max
+ * @param {{ bytes: number }} retained
  * @returns {Promise<Buffer>}
  */
-function readLimited(req, max) {
+function readLimited(req, max, retained) {
   return new Promise((resolve, reject) => {
     /** @type {Buffer[]} */
     const chunks = [];
     let size = 0;
     let failed = false;
-    req.on('data', (chunk) => {
+    const onData = (chunk) => {
       if (failed) return;
-      size += chunk.length;
-      if (size > max) {
+      if (size + chunk.length > max) {
         failed = true;
+        chunks.length = 0;
+        retained.bytes -= size;
+        size = 0;
+        cleanup();
+        req.pause();
         reject(Object.assign(new Error('request body too large'), { code: 'payload_too_large' }));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (!failed) resolve(Buffer.concat(chunks));
-    });
-    req.on('error', (error) => {
-      if (!failed) reject(error);
-    });
+      size += chunk.length;
+      retained.bytes += chunk.length;
+    };
+    const onEnd = () => {
+      if (failed) return;
+      cleanup();
+      const body = Buffer.concat(chunks);
+      chunks.length = 0;
+      retained.bytes -= size;
+      size = 0;
+      resolve(body);
+    };
+    const onError = (error) => {
+      if (failed) return;
+      failed = true;
+      chunks.length = 0;
+      retained.bytes -= size;
+      size = 0;
+      cleanup();
+      reject(error);
+    };
+    function cleanup() {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    }
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
+}
+
+/**
+ * Answer 413, then drop the unread body without keeping it. The socket stays
+ * up long enough for the JSON to leave. Past 1 MiB or 5 seconds it is destroyed.
+ * @param {import('node:http').ServerResponse} raw
+ * @param {import('node:http').IncomingMessage} incoming
+ * @param {(value: unknown) => unknown} scrub
+ */
+function refuseOversized(raw, incoming, scrub) {
+  const drain = discardIncoming(incoming);
+  sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub, {
+    connection: 'close',
+  }, () => drain.flushed());
+}
+
+/**
+ * Drop the unread body. `flushed` is called once the 413 has been written.
+ * Within 1 MiB and 5 seconds the socket is ended; past either limit it is destroyed.
+ * The bytes are counted and discarded, never stored.
+ * @param {import('node:http').IncomingMessage} req
+ */
+function discardIncoming(req) {
+  let seen = 0;
+  let over = false;
+  let ended = false;
+  let ready = false;
+  let settled = false;
+  const timer = setTimeout(() => {
+    over = true;
+    settle();
+  }, DRAIN_MAX_MS);
+  timer.unref();
+  const swallow = () => {};
+  const onData = (chunk) => {
+    seen += chunk.length;
+    if (seen > DRAIN_MAX_BYTES) {
+      over = true;
+      req.pause();
+      settle();
+    }
+  };
+  const onEnd = () => {
+    ended = true;
+    settle();
+  };
+  const onClose = () => {
+    ended = true;
+    settle();
+  };
+  req.on('error', swallow);
+  if (req.readableLength > DRAIN_MAX_BYTES) {
+    over = true;
+  } else if (req.readableEnded) {
+    ended = true;
+  } else {
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('close', onClose);
+    req.resume();
+  }
+
+  /**
+   * @returns {void}
+   */
+  function settle() {
+    if (settled || !ready || (!ended && !over)) return;
+    settled = true;
+    clearTimeout(timer);
+    req.removeListener('data', onData);
+    req.removeListener('end', onEnd);
+    req.removeListener('close', onClose);
+    if (!req.socket || req.socket.destroyed) return;
+    req.socket.on('error', swallow);
+    if (over) req.destroy();
+    else req.socket.end();
+  }
+
+  return {
+    flushed() {
+      ready = true;
+      settle();
+    },
+  };
 }
 
 /**
@@ -716,6 +842,14 @@ function sendJson(raw, status, body, scrub, headers, done) {
     'content-type': 'application/json; charset=utf-8',
     ...headers,
   });
+  // Node treats `Connection: close` as the last message and ends the socket
+  // when the response finishes, so the client can see ECONNRESET instead of
+  // the 413. Keep the socket up; discardIncoming ends or destroys it.
+  if (headers && headers.connection === 'close') {
+    raw.shouldKeepAlive = true;
+    raw._last = false;
+    if (raw.req) raw.req.shouldKeepAlive = true;
+  }
   raw.end(payload, () => {
     if (typeof done === 'function') done();
   });

@@ -16,7 +16,7 @@ import {
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
-/** Newest rows only. Listing must not walk the whole table. */
+/** Ids fetched per list. Both statements apply this bound in SQL. */
 const LIST_GET_MAX = 50;
 const SPAWN_MAX_DEFAULT = 5;
 const SPAWN_WINDOW_DEFAULT = 3_600_000;
@@ -94,7 +94,9 @@ export function createMissionFacade(deps) {
   const insert = sql.prepare(
     'INSERT INTO host_missions (id, agent_name, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING',
   );
-  const listed = sql.prepare('SELECT id FROM host_missions ORDER BY created_at DESC, id DESC');
+  const listed = sql.prepare(
+    'SELECT id FROM host_missions ORDER BY created_at DESC, id DESC LIMIT ?',
+  );
   const forget = sql.prepare('DELETE FROM host_missions WHERE id = ?');
 
   return {
@@ -156,7 +158,7 @@ export function createMissionFacade(deps) {
       const status = typeof opts.status === 'string' ? opts.status : undefined;
       /** @type {Record<string, unknown>[]} */
       const rows = [];
-      for (const row of listed.all().slice(0, LIST_GET_MAX)) {
+      for (const row of listed.all(LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
         const result = await callMission(() => client.request('GET', `/api/missions/${id}`));
@@ -189,7 +191,9 @@ export function createTaskFacade(deps) {
   const insert = sql.prepare(
     'INSERT INTO host_tasks (id, project, agent_name, title, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING',
   );
-  const listed = sql.prepare('SELECT id FROM host_tasks ORDER BY created_at DESC, id DESC');
+  const listed = sql.prepare(
+    'SELECT id FROM host_tasks ORDER BY created_at DESC, id DESC LIMIT ?',
+  );
   const forget = sql.prepare('DELETE FROM host_tasks WHERE id = ?');
 
   return {
@@ -215,7 +219,7 @@ export function createTaskFacade(deps) {
       const project = typeof opts.project === 'string' ? opts.project : undefined;
       /** @type {Record<string, unknown>[]} */
       const rows = [];
-      for (const row of listed.all().slice(0, LIST_GET_MAX)) {
+      for (const row of listed.all(LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
         const result = await callTask(() => client.request('GET', `/api/tasks/${id}`));
