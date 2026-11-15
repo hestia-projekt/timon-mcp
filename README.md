@@ -8,7 +8,7 @@ Licensed under the GNU Affero General Public License v3.0 only. See `LICENSE`.
 
 ## Install
 
-Node.js 22 or newer. From this directory, or from a packed archive:
+Node.js >=22.13 <23 || >=23.4. From this directory, or from a packed archive:
 
 ```bash
 timon plugin add .
@@ -162,13 +162,14 @@ Any TLS reverse proxy rewrites the public URLs onto the plugin prefix. `/.well-k
 
 ```nginx
 proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
 rewrite ^/.well-known/oauth-protected-resource$ /api/plugins/timon-mcp/oauth/protected-resource last;
 rewrite ^/.well-known/oauth-authorization-server$ /api/plugins/timon-mcp/oauth/authorization-server last;
 rewrite ^/oauth/(.*)$ /api/plugins/timon-mcp/oauth/$1 last;
 rewrite ^/mcp$ /api/plugins/timon-mcp/mcp last;
 ```
 
-The daemon compares `Origin` with `Host`. `proxy_set_header Host $host;` forwards the public host the client saw. Without that line the daemon would see the upstream address and refuse an `Origin` of the same site. `/mcp` must forward `Authorization` through to the daemon. Public paths clear the identity header at the edge, before the authentication proxy sets it, as above. `proxy_pass` to the daemon is an operator setting, not a value of the plugin.
+The daemon compares `Origin` with `Host`. `proxy_set_header Host $host;` forwards the public host the client saw. Without that line the daemon would see the upstream address and refuse an `Origin` of the same site. `proxy_set_header X-Real-IP $remote_addr;` replaces any client-supplied value with the address the proxy actually saw. `/mcp` must forward `Authorization` through to the daemon. Public paths clear the identity header at the edge, before the authentication proxy sets it, as above. `proxy_pass` to the daemon is an operator setting, not a value of the plugin.
 
 ## Clients
 
@@ -223,9 +224,31 @@ A public route has an anonymous caller. In that context, `missions.send` is forb
 
 `missions:control` is for `send`. The tools expose neither `kill`, nor `fork`, nor `stopScope`. `secrets:read` is only for the static token. `storage:sql` is only for OAuth clients, codes, and tokens. No configuration right (`agents:*`, `mcp-servers:*`, `skills:*`, `secrets:manage`, `secrets:list`, `secrets:broker`, `admin`, `agents:privileged-config`).
 
+## Standalone mode
+
+This mode runs the same plugin without loading it into the daemon. It is provisional. While a release refuses an unsigned plugin, a small host can serve the routes itself. When a later release loads the plugin, point the reverse proxy back at the daemon. One `proxy_pass` line switches to the host, and the same line pointed at the daemon restores the plugin. The paths stay `/api/plugins/timon-mcp/…`.
+
+The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js >=22.13 <23 || >=23.4, because `node:sqlite` is a stable built-in on that range, and has no npm dependency. The process checks the version before it loads that module: an older Node exits with a message on stderr and a non-zero status. The daemon 0.1.7 ships Node 22.23.4, so installing the plugin into the daemon is unchanged. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
+
+The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
+
+Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. A list reads at most the 50 newest recorded ids. The same call stops after 60 seconds, checked before each of those reads, and fails with a timeout instead of returning the rows already gathered. One read already started can still finish inside its own 20 second cap, so the list stays inside the idle limit below. An id the daemon answers with 404 is dropped from that record. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
+
+`spawn`, `send` and task creation share one sliding window. `TIMON_MCP_SPAWN_MAX` is how many of those calls are allowed (default 5). `TIMON_MCP_SPAWN_WINDOW_MS` is the window in milliseconds (default 3600000). Past the ceiling the tool result is `isError`, with the text `waiting for the operator's approval`, and the daemon is not called. The daemon token is a super-administrator, so this ceiling is the host's own quota.
+
+In this mode `summary` is null. The mission route used here does not carry one.
+
+Public paths keep the daemon limits: 60 requests a minute per address, a body of at most 64 KiB, and a cross-site POST is refused. The address is the socket peer. `X-Real-IP` is used only when `TIMON_MCP_TRUST_PROXY=1` and that peer is loopback, which is how the reverse proxy on this machine reaches the host. The proxy must set `proxy_set_header X-Real-IP $remote_addr;`. Any other value of the setting, or a peer that is not loopback, ignores the header. `X-Forwarded-For` is ignored. `GET /health` is not a public path.
+
+Any response sent before that body has been read leaves through one exit: `Connection: close`, then at most 1 MiB of the unread body is discarded over at most 5 seconds, then the socket is destroyed. That covers a non-public path, an unknown prefix, a method this host does not serve, a cross-site POST, a body past 64 KiB, a rate limit, and any later status written while the body is still unread. The server also stops incomplete headers after 10 seconds and an unfinished request after 30 seconds. An idle socket is closed after 120 seconds. `wait` writes nothing for up to 50 seconds. That handler can also make three daemon reads: one before the countdown starts, one poll still in flight when the countdown ends, and one final read. Each read is capped at 20 seconds. Ten seconds of margin keep the last read from losing the socket. Incomplete requests are checked every second, so those deadlines fire on time.
+
+An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=` and contains no secret. The operator replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together) and installs the unit. This package does not install it.
+
 ## Tests
 
 No npm dependency: the stateless subset of MCP Streamable HTTP is a small JSON-RPC core in `lib/mcp/`. `@timon-ai/sdk` is not published. The contract tests (`node:test`) follow the documented daemon contract and use the fake context in `test/helpers/fake-ctx.js`. The SQL double in the tests uses `node:sqlite`. The plugin itself calls only `ctx.sql`.
+
+The standalone host is covered by the same command. Those tests speak to an in-process fake daemon and do not call an installed daemon.
 
 ```bash
 npm test
