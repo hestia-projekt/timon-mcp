@@ -722,6 +722,67 @@ test('every early refusal closes a stalled body', async (t) => {
   assert.equal(after.status, 503);
 });
 
+test('a refused request whose body arrived in full is closed at once', async (t) => {
+  const stack = await openStack(t, { daemon: false });
+  const body = '0123456789';
+  const second = `GET ${PREFIX}/oauth/protected-resource HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`;
+  const observed = await new Promise((resolve) => {
+    const started = Date.now();
+    const socket = netConnect(stack.host.port, '127.0.0.1');
+    let buf = '';
+    let settled = false;
+    let scheduled = false;
+    let writeDone = false;
+    let closedAt = 0;
+    const deadline = setTimeout(() => finish(true), 1200);
+    function finish(force) {
+      if (settled) return;
+      if (!force && (!writeDone || !closedAt)) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (!closedAt) socket.destroy();
+      resolve({
+        buf,
+        ms: (closedAt || Date.now()) - started,
+        writeDone,
+      });
+    }
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('latin1');
+      if (scheduled || responseByteLength(buf) === -1) return;
+      scheduled = true;
+      setTimeout(() => {
+        writeDone = true;
+        try { socket.write(second); } catch { /* the socket is already gone */ }
+        finish(false);
+      }, 100);
+    });
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      closedAt = Date.now();
+      finish(false);
+    });
+    socket.on('connect', () => {
+      socket.write([
+        `POST ${PREFIX}/oauth/unknown HTTP/1.1`,
+        'Host: 127.0.0.1',
+        'Content-Length: 10',
+        '',
+        body,
+      ].join('\r\n'));
+    });
+  });
+  const end = responseByteLength(observed.buf);
+  assert.ok(end > 0, observed.buf.slice(0, 180));
+  const first = parseRawHttp(observed.buf.slice(0, end));
+  assert.equal(first.status, 401);
+  assert.equal(first.connection, 'close');
+  assert.ok(observed.ms < 1000, `socket closed after ${observed.ms}ms; tail=${JSON.stringify(observed.buf.slice(end, end + 80))}`);
+  assert.equal(observed.buf.slice(end), '');
+  assert.equal(observed.writeDone, true);
+  assert.equal(stack.host.bodyBytesRetained(), 0);
+});
+
 test('the socket idle timeout outlasts the longest wait', async (t) => {
   const stack = await openStack(t, { daemon: false });
   // Initial read, a poll still in flight when the countdown ends, and the
@@ -1016,6 +1077,20 @@ function stallBody(port, item) {
       ].join('\r\n'));
     });
   });
+}
+
+/**
+ * Byte length of one complete HTTP response, or -1 while it is still short.
+ * @param {string} buf
+ * @returns {number}
+ */
+function responseByteLength(buf) {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd === -1) return -1;
+  const match = /content-length:\s*(\d+)/i.exec(buf.slice(0, headEnd));
+  if (!match) return -1;
+  const total = headEnd + 4 + Number(match[1]);
+  return buf.length >= total ? total : -1;
 }
 
 /**

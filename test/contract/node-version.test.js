@@ -8,7 +8,9 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   MIN_STANDALONE_NODE,
+  STANDALONE_NODE_RANGE,
   nodeSupportsSqlite,
+  parseNodeVersion,
   standaloneNodeMessage,
 } from '../../host/node-version.js';
 
@@ -31,18 +33,35 @@ test('node:sqlite is required from Node.js 22.13', () => {
   assert.equal(nodeSupportsSqlite('23.4.0'), true);
   assert.equal(nodeSupportsSqlite('24.0.0'), true);
   const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
-  const [major, minor] = MIN_STANDALONE_NODE;
-  assert.equal(pkg.engines.node, `>=${major}.${minor}`);
+  assert.equal(pkg.engines.node, STANDALONE_NODE_RANGE);
   const message = standaloneNodeMessage('22.12.0');
-  assert.match(message, /Node\.js 22\.13 or newer/);
+  assert.match(message, /Node\.js >=22\.13 <23 \|\| >=23\.4/);
   assert.match(message, /node:sqlite/);
   assert.match(message, /v22\.12\.0/);
+});
+
+test('engines.node and nodeSupportsSqlite agree on the published range', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+  const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+  assert.equal(pkg.engines.node, '>=22.13 <23 || >=23.4');
+  assert.equal(pkg.engines.node, STANDALONE_NODE_RANGE);
+  assert.equal(standaloneNodeMessage('23.3.9').includes(pkg.engines.node), true);
+  assert.match(readme, /^Node\.js >=22\.13 <23 \|\| >=23\.4\. From this directory/m);
+  assert.match(readme, /It needs Node\.js >=22\.13 <23 \|\| >=23\.4, because/);
+  const samples = ['22.12.9', '22.13.0', '23.3.9', '23.4.0', '24.0.0'];
+  for (const version of samples) {
+    assert.equal(
+      satisfiesNodeRange(pkg.engines.node, version),
+      nodeSupportsSqlite(version),
+      version,
+    );
+  }
 });
 
 test('the standalone process refuses Node.js older than 22.13', async () => {
   const result = await runPinned('22.12.0');
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /Node\.js 22\.13 or newer/);
+  assert.match(result.stderr, /Node\.js >=22\.13 <23 \|\| >=23\.4/);
   assert.match(result.stderr, /node:sqlite/);
   assert.match(result.stderr, /v22\.12\.0/);
   assert.equal(result.stderr.includes('TIMON_MCP_PORT'), false);
@@ -60,6 +79,37 @@ test('Node.js 22.13 passes the version gate and still reports a bad port', async
   assert.equal(result.stdout.includes(result.secret), false);
   assert.equal(result.stderr.includes(result.secret), false);
 });
+
+/**
+ * npm treats a partial version in `engines` as zero-padded (`22.13` is `22.13.0`).
+ * @param {string} range
+ * @param {string} version
+ */
+function satisfiesNodeRange(range, version) {
+  const actual = parseNodeVersion(version);
+  return range.split('||').some((alternative) => alternative.trim().split(/\s+/).filter(Boolean).every((comparator) => {
+    const match = /^(>=|<=|>|<|=)?(\d+(?:\.\d+){0,2})$/.exec(comparator);
+    if (!match) return false;
+    const operator = match[1] || '=';
+    const order = compareVersions(actual, parseNodeVersion(match[2]));
+    if (operator === '>=') return order >= 0;
+    if (operator === '<=') return order <= 0;
+    if (operator === '>') return order > 0;
+    if (operator === '<') return order < 0;
+    return order === 0;
+  }));
+}
+
+/**
+ * @param {[number, number, number]} left
+ * @param {[number, number, number]} right
+ */
+function compareVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1;
+  }
+  return 0;
+}
 
 /**
  * Pins `process.versions.node` before the entry module runs.

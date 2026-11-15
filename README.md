@@ -8,7 +8,7 @@ Licensed under the GNU Affero General Public License v3.0 only. See `LICENSE`.
 
 ## Install
 
-Node.js 22.13 or newer. From this directory, or from a packed archive:
+Node.js >=22.13 <23 || >=23.4. From this directory, or from a packed archive:
 
 ```bash
 timon plugin add .
@@ -228,7 +228,7 @@ A public route has an anonymous caller. In that context, `missions.send` is forb
 
 This mode runs the same plugin without loading it into the daemon. It is provisional. While a release refuses an unsigned plugin, a small host can serve the routes itself. When a later release loads the plugin, point the reverse proxy back at the daemon. One `proxy_pass` line switches to the host, and the same line pointed at the daemon restores the plugin. The paths stay `/api/plugins/timon-mcp/…`.
 
-The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js 22.13 or newer, because `node:sqlite` is only a stable built-in from that release, and has no npm dependency. The process checks the version before it loads that module: an older Node exits with a message on stderr and a non-zero status. The daemon 0.1.7 ships Node 22.23.4, so installing the plugin into the daemon is unchanged. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
+The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js >=22.13 <23 || >=23.4, because `node:sqlite` is a stable built-in on that range, and has no npm dependency. The process checks the version before it loads that module: an older Node exits with a message on stderr and a non-zero status. The daemon 0.1.7 ships Node 22.23.4, so installing the plugin into the daemon is unchanged. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
 
 The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
 

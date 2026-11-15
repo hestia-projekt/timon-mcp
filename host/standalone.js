@@ -795,9 +795,11 @@ function readLimited(req, max, retained) {
 /**
  * Single exit for every response sent before the body has been read in full.
  * `Connection: close`, discard at most 1 MiB over at most 5 seconds, then
- * `destroy()`. 401, 403, 404, 405, 413, 429 and any later status all come
- * through here. The response guard calls the same close if some other write
- * happens while the body is still unread, so a new branch cannot skip it.
+ * close the socket. A finished body uses `destroySoon()`; a body past the
+ * budget or the deadline is destroyed at once. 401, 403, 404, 405, 413, 429
+ * and any later status all come through here. The response guard calls the
+ * same close if some other write happens while the body is still unread, so
+ * a new branch cannot skip it.
  * @param {import('node:http').ServerResponse} raw
  * @param {import('node:http').IncomingMessage} incoming
  * @param {(value: unknown) => unknown} scrub
@@ -829,10 +831,13 @@ function refuseOversized(raw, incoming, scrub) {
 
 /**
  * Drop the unread body. `flushed` runs once the response has been written.
- * Bytes are counted and discarded, never stored. Past 1 MiB or 5 seconds,
- * or once the body ends inside that budget, the socket is destroyed.
- * The deadline cannot destroy the socket before `flushed`, so the status
- * line has left. Nothing is retained.
+ * Bytes are counted and discarded, never stored. Past 1 MiB or 5 seconds
+ * the socket is destroyed at once. When the body ends inside that budget,
+ * `req.socket.destroySoon()` closes it after the response has left.
+ * `IncomingMessage._destroy` only destroys the socket when the message is
+ * interrupted, so a finished body must close the socket itself. The
+ * deadline cannot run before `flushed`, so the status line has left.
+ * Nothing is retained.
  * @param {import('node:http').IncomingMessage} req
  */
 function discardIncoming(req) {
@@ -890,7 +895,8 @@ function discardIncoming(req) {
     req.removeListener('close', onClose);
     if (!req.socket || req.socket.destroyed) return;
     req.socket.on('error', swallow);
-    req.destroy();
+    if (ended && !over) req.socket.destroySoon();
+    else req.socket.destroy();
   }
 
   return {
@@ -969,7 +975,7 @@ function requestCarriesBody(req) {
 
 /**
  * Any write before the body is consumed takes the `refuseEarly` close:
- * `Connection: close`, bounded discard, then `destroy()`.
+ * `Connection: close`, bounded discard, then the socket is closed.
  * @param {import('node:http').ServerResponse} raw
  */
 function installResponseGuard(raw) {

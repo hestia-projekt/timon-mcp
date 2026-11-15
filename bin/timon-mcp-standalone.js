@@ -5,7 +5,7 @@
  *
  * The version check runs before `host/standalone.js` is loaded. A static
  * import would pull in `node:sqlite` first and fail with Node's own error
- * on every release before 22.13.
+ * outside `>=22.13 <23 || >=23.4`.
  */
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';

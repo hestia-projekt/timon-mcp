@@ -8,6 +8,9 @@
  */
 export const MIN_STANDALONE_NODE = Object.freeze([22, 13, 0]);
 
+/** Same bound as `engines.node`, the startup message and the README. */
+export const STANDALONE_NODE_RANGE = '>=22.13 <23 || >=23.4';
+
 /**
  * Lowest unflagged `node:sqlite` on each major line. A major absent from
  * this map is refused below 24 and accepted from 24 up.
@@ -50,8 +53,7 @@ export function nodeSupportsSqlite(version) {
  * @returns {string}
  */
 export function standaloneNodeMessage(version) {
-  const [major, minor] = MIN_STANDALONE_NODE;
   const raw = String(version ?? '');
   const shown = raw.startsWith('v') ? raw : `v${raw}`;
-  return `timon-mcp standalone needs Node.js ${major}.${minor} or newer (node:sqlite). This process is ${shown}.`;
+  return `timon-mcp standalone needs Node.js ${STANDALONE_NODE_RANGE} (node:sqlite). This process is ${shown}.`;
 }
