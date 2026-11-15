@@ -385,7 +385,7 @@ test('the spawn ceiling slides forward with the window', async (t) => {
 });
 
 test('list reads at most the 50 newest ids and forgets a 404', async (t) => {
-  const stack = await openStack(t);
+  const stack = await openStack(t, { recordReads: true });
   const insertMission = stack.host.ctx.sql.prepare(
     'INSERT INTO host_missions (id, agent_name, created_at) VALUES (?, ?, ?)',
   );
@@ -573,6 +573,61 @@ test('a body past the drain budget closes the socket and is not stored', async (
     });
   });
   assert.ok(result.code === 'ECONNRESET' || result.code === 'EPIPE' || result.code === 'ECONNABORTED', result.code);
+  assert.equal(result.retainedDuring, 0);
+  assert.equal(result.retained, 0);
+  const dumped = JSON.stringify(stack.logs) + JSON.stringify(stack.journal);
+  assert.equal(dumped.includes(marker), false);
+});
+
+test('a cross-site body past the drain budget closes the socket and is not stored', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
+  const marker = 'CROSS-SITE-MARKER-9c2e';
+  const declared = (1024 * 1024) + (256 * 1024);
+  const piece = Buffer.concat([Buffer.from(marker), Buffer.alloc(32 * 1024, 0x63)]);
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for the close')), 3000);
+    const socket = netConnect(stack.host.port, '127.0.0.1');
+    let written = 0;
+    let retainedDuring = 0;
+    let code = null;
+    const finish = () => {
+      clearTimeout(timer);
+      resolve({
+        code,
+        written,
+        retainedDuring,
+        retained: stack.host.bodyBytesRetained(),
+      });
+    };
+    socket.on('error', (err) => { code = err.code; });
+    socket.on('close', finish);
+    socket.on('connect', () => {
+      socket.write([
+        `POST ${PREFIX}/mcp HTTP/1.1`,
+        'Host: 127.0.0.1',
+        'Content-Type: application/json',
+        'Origin: null',
+        `Content-Length: ${declared}`,
+        '',
+        '',
+      ].join('\r\n'));
+      const pump = () => {
+        if (socket.destroyed) return;
+        while (written < declared) {
+          retainedDuring = Math.max(retainedDuring, stack.host.bodyBytesRetained());
+          const ok = socket.write(piece);
+          written += piece.length;
+          if (!ok) {
+            socket.once('drain', pump);
+            return;
+          }
+        }
+      };
+      pump();
+    });
+  });
+  assert.ok(result.code === 'ECONNRESET' || result.code === 'EPIPE' || result.code === 'ECONNABORTED', result.code);
+  assert.ok(result.written > 1024 * 1024, result.written);
   assert.equal(result.retainedDuring, 0);
   assert.equal(result.retained, 0);
   const dumped = JSON.stringify(stack.logs) + JSON.stringify(stack.journal);

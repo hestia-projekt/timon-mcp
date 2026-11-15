@@ -50,6 +50,7 @@ export async function openStack(t, options = {}) {
       journal,
       logs,
       now: options.now,
+      recordReads: options.recordReads === true,
     });
   } catch (err) {
     if (daemon) await daemon.close();

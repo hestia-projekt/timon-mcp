@@ -21,6 +21,8 @@ const PUBLIC_BODY_MAX = 64 * 1024;
 /** Bytes of an already-refused body that may be discarded before the socket is destroyed. */
 const DRAIN_MAX_BYTES = 1024 * 1024;
 const DRAIN_MAX_MS = 5_000;
+/** `.all()` row counts kept when a test sets `recordReads`. Production records none. */
+const READ_COUNT_KEEP = 64;
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 60;
 const SETTING_KEYS = [
@@ -44,6 +46,7 @@ const SETTING_KEYS = [
  * @param {Array<{ method: string, path: string, status: number }>} [options.journal]
  * @param {Array<{ level: string, message: string }>} [options.logs]
  * @param {() => number} [options.now] Clock for the spawn quota. Tests inject it.
+ * @param {boolean} [options.recordReads] When true, `ctx.sql` keeps the last 64 `.all()` row counts. Off in production.
  */
 export async function startStandalone(options = {}) {
   const env = options.env ?? process.env;
@@ -67,7 +70,7 @@ export async function startStandalone(options = {}) {
     bearerName: BEARER_SECRET,
     journal,
   });
-  const sql = createSql(db);
+  const sql = createSql(db, options.recordReads === true);
   const disposers = [];
   /** @type {ReturnType<typeof createRouter>[]} */
   const routers = [];
@@ -340,9 +343,10 @@ function applyMigrations(db, migrationsDir) {
 
 /**
  * @param {import('node:sqlite').DatabaseSync} db
+ * @param {boolean} [recordReads] Test-only. Production leaves this false, so `.all()` stores nothing.
  */
-function createSql(db) {
-  /** Row counts materialized by `.all()`, in call order. */
+function createSql(db, recordReads = false) {
+  /** Last `.all()` row counts. Empty for the life of the process unless a test opted in. */
   const readCounts = [];
   return {
     readCounts,
@@ -358,7 +362,12 @@ function createSql(db) {
         },
         all(...params) {
           const rows = stmt.all(...params);
-          readCounts.push(rows.length);
+          if (recordReads) {
+            readCounts.push(rows.length);
+            if (readCounts.length > READ_COUNT_KEEP) {
+              readCounts.splice(0, readCounts.length - READ_COUNT_KEEP);
+            }
+          }
           return rows;
         },
         run(...params) {
@@ -461,8 +470,7 @@ async function handleHttp(input) {
     return;
   }
   if (crossSite(incoming)) {
-    sendJson(raw, 403, { error: 'cross-site request refused' }, scrub);
-    drain(incoming);
+    refuseEarly(raw, incoming, scrub, 403, { error: 'cross-site request refused' });
     return;
   }
   const declared = declaredLength(incoming);
@@ -472,10 +480,10 @@ async function handleHttp(input) {
   }
   const rate = takeRate(buckets, clientAddress(incoming, trustProxy), Date.now());
   if (!rate.ok) {
-    sendJson(raw, 429, { error: 'too many requests, try again later', code: 'too_many_attempts' }, scrub, {
-      'retry-after': String(rate.retry),
-    });
-    drain(incoming);
+    refuseEarly(raw, incoming, scrub, 429, {
+      error: 'too many requests, try again later',
+      code: 'too_many_attempts',
+    }, { 'retry-after': String(rate.retry) });
     return;
   }
 
@@ -728,6 +736,23 @@ function readLimited(req, max, retained) {
 }
 
 /**
+ * Answer, then drop the unread body without keeping it. Same bound for 403, 413 and 429.
+ * @param {import('node:http').ServerResponse} raw
+ * @param {import('node:http').IncomingMessage} incoming
+ * @param {(value: unknown) => unknown} scrub
+ * @param {number} status
+ * @param {unknown} body
+ * @param {Record<string, string>} [headers]
+ */
+function refuseEarly(raw, incoming, scrub, status, body, headers) {
+  const drop = discardIncoming(incoming);
+  sendJson(raw, status, body, scrub, {
+    ...(headers || {}),
+    connection: 'close',
+  }, () => drop.flushed());
+}
+
+/**
  * Answer 413, then drop the unread body without keeping it. The socket stays
  * up long enough for the JSON to leave. Past 1 MiB or 5 seconds it is destroyed.
  * @param {import('node:http').ServerResponse} raw
@@ -735,16 +760,18 @@ function readLimited(req, max, retained) {
  * @param {(value: unknown) => unknown} scrub
  */
 function refuseOversized(raw, incoming, scrub) {
-  const drain = discardIncoming(incoming);
-  sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub, {
-    connection: 'close',
-  }, () => drain.flushed());
+  refuseEarly(raw, incoming, scrub, 413, {
+    error: 'request body too large',
+    code: 'payload_too_large',
+  });
 }
 
 /**
- * Drop the unread body. `flushed` is called once the 413 has been written.
+ * Drop the unread body. `flushed` runs once the response has been written.
  * Within 1 MiB and 5 seconds the socket is ended; past either limit it is destroyed.
  * The bytes are counted and discarded, never stored.
+ * The deadline cannot close the socket before `flushed`. If the client never
+ * reads the response, Node's request timeout is what ends it. Nothing is retained.
  * @param {import('node:http').IncomingMessage} req
  */
 function discardIncoming(req) {
@@ -812,14 +839,6 @@ function discardIncoming(req) {
 }
 
 /**
- * @param {import('node:http').IncomingMessage} req
- */
-function drain(req) {
-  req.on('data', () => {});
-  req.resume();
-}
-
-/**
  * @param {import('node:http').ServerResponse} raw
  * @param {number} status
  * @param {unknown} body
@@ -843,8 +862,9 @@ function sendJson(raw, status, body, scrub, headers, done) {
     ...headers,
   });
   // Node treats `Connection: close` as the last message and ends the socket
-  // when the response finishes, so the client can see ECONNRESET instead of
-  // the 413. Keep the socket up; discardIncoming ends or destroys it.
+  // when the response finishes (`_last` / `shouldKeepAlive`, Node 22.23.4).
+  // The client can then see ECONNRESET instead of the JSON. Keep the socket
+  // up; discardIncoming ends it, or destroys it past 1 MiB or 5 seconds.
   if (headers && headers.connection === 'close') {
     raw.shouldKeepAlive = true;
     raw._last = false;
