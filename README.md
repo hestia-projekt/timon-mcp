@@ -223,9 +223,25 @@ A public route has an anonymous caller. In that context, `missions.send` is forb
 
 `missions:control` is for `send`. The tools expose neither `kill`, nor `fork`, nor `stopScope`. `secrets:read` is only for the static token. `storage:sql` is only for OAuth clients, codes, and tokens. No configuration right (`agents:*`, `mcp-servers:*`, `skills:*`, `secrets:manage`, `secrets:list`, `secrets:broker`, `admin`, `agents:privileged-config`).
 
+## Standalone mode
+
+This mode runs the same plugin without loading it into the daemon. It is provisional. While a release refuses an unsigned plugin, a small host can serve the routes itself. When a later release loads the plugin, point the reverse proxy back at the daemon. One `proxy_pass` line switches to the host, and the same line pointed at the daemon restores the plugin. The paths stay `/api/plugins/timon-mcp/…`.
+
+The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the port. When it is unset, the port is 3098. It needs Node.js 22 or newer and has no npm dependency. `lib/` is unchanged: the host builds the plugin context and calls `apply()`.
+
+The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
+
+Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
+
+Public paths keep the daemon limits: 60 requests a minute per address, taken from `X-Real-IP`, a body of at most 64 KiB, and a cross-site POST is refused. `GET /health` is not a public path.
+
+An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=` and contains no secret. The operator replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together) and installs the unit. This package does not install it.
+
 ## Tests
 
 No npm dependency: the stateless subset of MCP Streamable HTTP is a small JSON-RPC core in `lib/mcp/`. `@timon-ai/sdk` is not published. The contract tests (`node:test`) follow the documented daemon contract and use the fake context in `test/helpers/fake-ctx.js`. The SQL double in the tests uses `node:sqlite`. The plugin itself calls only `ctx.sql`.
+
+The standalone host is covered by the same command. Those tests speak to an in-process fake daemon and do not call an installed daemon.
 
 ```bash
 npm test

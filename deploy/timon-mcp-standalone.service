@@ -1,0 +1,17 @@
+[Unit]
+Description=Standalone host for the timon-mcp plugin
+# Example user unit. The operator installs it; this package does not enable it.
+# EnvironmentFile may set TIMON_MCP_PORT, TIMON_DAEMON_URL, TIMON_DAEMON_TOKEN_FILE,
+# TIMON_MCP_DB, TIMON_MCP_SETTINGS and TIMON_MCP_BEARER_TOKEN.
+# Values belong in that file, never in this unit.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/timon-mcp
+ExecStart=/usr/bin/node %h/.local/share/timon-mcp/bin/timon-mcp-standalone.js
+EnvironmentFile=-%h/.config/timon-mcp/standalone.env
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
