@@ -514,6 +514,7 @@ test('a POST of 65537 bytes receives the JSON 413', async (t) => {
       });
     });
     req.on('error', (err) => {
+      if (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ECONNABORTED') return;
       clearTimeout(timer);
       reject(err);
     });
@@ -632,6 +633,120 @@ test('a cross-site body past the drain budget closes the socket and is not store
   assert.equal(result.retained, 0);
   const dumped = JSON.stringify(stack.logs) + JSON.stringify(stack.journal);
   assert.equal(dumped.includes(marker), false);
+});
+
+test('every early refusal closes a stalled body', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
+  const limitedIp = '203.0.113.80';
+  for (let i = 0; i < 60; i += 1) {
+    const opened = await rawCall(stack.host.baseUrl, {
+      path: `${PREFIX}/oauth/protected-resource`,
+      headers: { 'x-real-ip': limitedIp },
+    });
+    assert.equal(opened.status, 503);
+  }
+
+  const cases = [
+    {
+      status: 401,
+      method: 'POST',
+      path: `${PREFIX}/oauth/unknown`,
+      headers: ['X-Real-IP: 203.0.113.81'],
+      field: 'error',
+      expect: 'unauthorized',
+    },
+    {
+      status: 404,
+      method: 'POST',
+      path: '/no-such',
+      headers: ['X-Real-IP: 203.0.113.82'],
+      field: 'error',
+      expect: 'not_found',
+    },
+    {
+      status: 405,
+      method: 'PROPFIND',
+      path: `${PREFIX}/mcp`,
+      headers: ['X-Real-IP: 203.0.113.83'],
+      field: 'error',
+      expect: 'method_not_allowed',
+    },
+    {
+      status: 403,
+      method: 'POST',
+      path: `${PREFIX}/mcp`,
+      headers: ['Origin: null', 'X-Real-IP: 203.0.113.84'],
+      field: 'error',
+      expect: 'cross-site request refused',
+    },
+    {
+      status: 413,
+      method: 'POST',
+      path: `${PREFIX}/mcp`,
+      headers: ['Content-Type: application/json', 'X-Real-IP: 203.0.113.85'],
+      contentLength: 200_000,
+      field: 'code',
+      expect: 'payload_too_large',
+    },
+    {
+      status: 429,
+      method: 'POST',
+      path: `${PREFIX}/mcp`,
+      headers: ['Content-Type: application/json', `X-Real-IP: ${limitedIp}`],
+      contentLength: 4096,
+      field: 'code',
+      expect: 'too_many_attempts',
+    },
+  ];
+
+  let peak = 0;
+  const sampler = setInterval(() => {
+    peak = Math.max(peak, stack.host.bodyBytesRetained());
+  }, 20);
+  const results = await Promise.all(cases.map((item) => stallBody(stack.host.port, item)));
+  clearInterval(sampler);
+
+  for (const result of results) {
+    assert.equal(result.status, result.expectStatus, `${result.method} ${result.path} ${result.head}`);
+    assert.equal(result.connection, 'close', result.method);
+    assert.equal(result.json && result.json[result.field], result.expect, result.method);
+    assert.ok(result.ms < 8000, `${result.method} closed after ${result.ms}ms`);
+  }
+  assert.equal(peak, 0);
+  assert.equal(stack.host.bodyBytesRetained(), 0);
+
+  const after = await rawCall(stack.host.baseUrl, {
+    path: `${PREFIX}/oauth/protected-resource`,
+    headers: { 'x-real-ip': '203.0.113.90' },
+  });
+  assert.equal(after.status, 503);
+});
+
+test('slow headers are closed by the server timeout', async (t) => {
+  const stack = await openStack(t, { daemon: false });
+  const started = Date.now();
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('headers stayed open'));
+    }, 15_000);
+    const socket = netConnect(stack.host.port, '127.0.0.1');
+    let buf = '';
+    socket.on('data', (chunk) => { buf += chunk.toString('latin1'); });
+    socket.on('error', () => {});
+    socket.on('close', () => {
+      clearTimeout(timer);
+      resolve({ buf, ms: Date.now() - started });
+    });
+    socket.on('connect', () => {
+      socket.write(`POST ${PREFIX}/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n`);
+    });
+  });
+  assert.ok(result.ms >= 9_000, String(result.ms));
+  assert.ok(result.ms < 14_000, String(result.ms));
+  assert.match(result.buf, /^HTTP\/1\.[01] 408\b/);
+  assert.match(result.buf, /connection:\s*close/i);
+  assert.equal(stack.host.bodyBytesRetained(), 0);
 });
 
 test('X-Real-IP is ignored unless the peer is a trusted loopback proxy', async (t) => {
@@ -846,6 +961,90 @@ test('importing the cli does not listen', async () => {
   assert.equal(stdout.includes('listening'), false);
   assert.equal(stderr.includes('failed to start'), false);
 });
+
+/**
+ * Sends headers, then leaves the declared body unsent. Resolves when the socket closes.
+ * @param {number} port
+ * @param {{ status: number, method: string, path: string, headers: string[], contentLength?: number, field: string, expect: string }} item
+ */
+function stallBody(port, item) {
+  const length = item.contentLength || 4096;
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const socket = netConnect(port, '127.0.0.1');
+    let buf = '';
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`${item.method} ${item.path} stayed open`));
+    }, 8000);
+    const finish = () => {
+      clearTimeout(timer);
+      const parsed = parseRawHttp(buf);
+      resolve({
+        ...parsed,
+        method: item.method,
+        path: item.path,
+        field: item.field,
+        expect: item.expect,
+        expectStatus: item.status,
+        ms: Date.now() - started,
+      });
+    };
+    socket.on('data', (chunk) => { buf += chunk.toString('latin1'); });
+    socket.on('error', () => {});
+    socket.on('close', finish);
+    socket.on('connect', () => {
+      socket.write([
+        `${item.method} ${item.path} HTTP/1.1`,
+        'Host: 127.0.0.1',
+        `Content-Length: ${length}`,
+        ...item.headers,
+        '',
+        '',
+      ].join('\r\n'));
+    });
+  });
+}
+
+/**
+ * @param {string} buf
+ */
+function parseRawHttp(buf) {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  const head = headEnd === -1 ? buf : buf.slice(0, headEnd);
+  const status = Number(/^HTTP\/1\.[01] (\d+)/.exec(head)?.[1]);
+  /** @type {Record<string, string>} */
+  const headers = {};
+  for (const line of head.split('\r\n').slice(1)) {
+    const split = line.indexOf(':');
+    if (split === -1) continue;
+    headers[line.slice(0, split).trim().toLowerCase()] = line.slice(split + 1).trim();
+  }
+  let rawBody = headEnd === -1 ? '' : buf.slice(headEnd + 4);
+  if ((headers['transfer-encoding'] || '').includes('chunked')) rawBody = decodeChunks(rawBody);
+  let json = null;
+  try { json = rawBody ? JSON.parse(rawBody) : null; } catch { json = null; }
+  return { status, headers, connection: headers.connection, json, head, rawBody };
+}
+
+/**
+ * @param {string} raw
+ */
+function decodeChunks(raw) {
+  let out = '';
+  let rest = raw;
+  while (rest.length > 0) {
+    const lineEnd = rest.indexOf('\r\n');
+    if (lineEnd === -1) return out;
+    const size = Number.parseInt(rest.slice(0, lineEnd), 16);
+    if (!Number.isFinite(size)) return out;
+    if (size === 0) return out;
+    const start = lineEnd + 2;
+    out += rest.slice(start, start + size);
+    rest = rest.slice(start + size + 2);
+  }
+  return out;
+}
 
 /**
  * @param {string} baseUrl

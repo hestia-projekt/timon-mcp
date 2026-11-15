@@ -21,6 +21,23 @@ const PUBLIC_BODY_MAX = 64 * 1024;
 /** Bytes of an already-refused body that may be discarded before the socket is destroyed. */
 const DRAIN_MAX_BYTES = 1024 * 1024;
 const DRAIN_MAX_MS = 5_000;
+/**
+ * Defense in depth, outside `refuseEarly`. A slow header cannot outlive
+ * `HEADERS_TIMEOUT_MS`. A request that stalls after the headers cannot outlive
+ * `REQUEST_TIMEOUT_MS`. `SOCKET_TIMEOUT_MS` is inactivity on the socket, so a
+ * slow read is still bounded once the handler has started. Incomplete requests
+ * are checked every `CONNECTIONS_CHECK_MS`, which is what makes the two
+ * request deadlines fire on time.
+ */
+const HEADERS_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const SOCKET_TIMEOUT_MS = 30_000;
+const CONNECTIONS_CHECK_MS = 1_000;
+/** Methods this host will route. Any other method is a 405 before the body is read. */
+const SERVED_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT']);
+const kArmed = Symbol('earlyArmed');
+const kBodyConsumed = Symbol('bodyConsumed');
+const kOriginalEnd = Symbol('originalEnd');
 /** `.all()` row counts kept when a test sets `recordReads`. Production records none. */
 const READ_COUNT_KEEP = 64;
 const RATE_WINDOW_MS = 60_000;
@@ -134,6 +151,7 @@ export async function startStandalone(options = {}) {
   };
 
   const server = createServer((incoming, raw) => {
+    installResponseGuard(raw);
     handleHttp({
       incoming,
       raw,
@@ -145,16 +163,28 @@ export async function startStandalone(options = {}) {
       trustProxy,
       retained,
     }).catch(() => {
-      if (!raw.writableEnded) {
-        try {
-          raw.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-          raw.end('{"error":"internal_error"}');
-        } catch { /* the socket is already gone */ }
-      }
+      if (raw.headersSent || raw.writableEnded) return;
+      try {
+        refuseEarly(raw, incoming, client.scrub, 500, { error: 'internal_error' });
+      } catch { /* the socket is already gone */ }
     });
   });
-  server.on('clientError', (_err, socket) => {
-    socket.destroy();
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.timeout = SOCKET_TIMEOUT_MS;
+  server.connectionsCheckingInterval = CONNECTIONS_CHECK_MS;
+  server.on('clientError', (err, socket) => {
+    // A listener replaces Node's default reply. Header and request timeouts
+    // arrive here as ERR_HTTP_REQUEST_TIMEOUT before any handler runs, so the
+    // 408 has to be written from this hook. Destroying at once drops those bytes.
+    if (!socket.writable) {
+      socket.destroy();
+      return;
+    }
+    const timeout = err && err.code === 'ERR_HTTP_REQUEST_TIMEOUT';
+    const status = timeout ? 408 : 400;
+    const reason = timeout ? 'Request Timeout' : 'Bad Request';
+    socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   });
 
   try {
@@ -456,17 +486,23 @@ async function handleHttp(input) {
   try {
     url = new URL(incoming.url || '/', 'http://127.0.0.1');
   } catch {
-    sendJson(raw, 400, { error: 'bad_request' }, scrub);
+    refuseEarly(raw, incoming, scrub, 400, { error: 'bad_request' });
     return;
   }
   const rest = splitPrefix(url.pathname, prefix);
   if (rest === null) {
-    sendJson(raw, 404, { error: 'not_found' }, scrub);
+    refuseEarly(raw, incoming, scrub, 404, { error: 'not_found' });
     return;
   }
   const method = (incoming.method || 'GET').toUpperCase();
+  if (!SERVED_METHODS.has(method)) {
+    refuseEarly(raw, incoming, scrub, 405, { error: 'method_not_allowed' }, {
+      allow: 'DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT',
+    });
+    return;
+  }
   if (!isPublic(method, rest, publicPaths)) {
-    sendJson(raw, 401, { error: 'unauthorized' }, scrub);
+    refuseEarly(raw, incoming, scrub, 401, { error: 'unauthorized' });
     return;
   }
   if (crossSite(incoming)) {
@@ -500,9 +536,10 @@ async function handleHttp(input) {
         refuseOversized(raw, incoming, scrub);
         return;
       }
-      sendJson(raw, 400, { error: 'bad_request' }, scrub);
+      refuseEarly(raw, incoming, scrub, 400, { error: 'bad_request' });
       return;
     }
+    markBodyConsumed(incoming);
     const type = headerValue(incoming, 'content-type').toLowerCase();
     if (type.includes('application/json')) {
       if (rawBody.length === 0) body = {};
@@ -736,7 +773,11 @@ function readLimited(req, max, retained) {
 }
 
 /**
- * Answer, then drop the unread body without keeping it. Same bound for 403, 413 and 429.
+ * Single exit for every response sent before the body has been read in full.
+ * `Connection: close`, discard at most 1 MiB over at most 5 seconds, then
+ * `destroy()`. 401, 403, 404, 405, 413, 429 and any later status all come
+ * through here. The response guard calls the same close if some other write
+ * happens while the body is still unread, so a new branch cannot skip it.
  * @param {import('node:http').ServerResponse} raw
  * @param {import('node:http').IncomingMessage} incoming
  * @param {(value: unknown) => unknown} scrub
@@ -745,11 +786,11 @@ function readLimited(req, max, retained) {
  * @param {Record<string, string>} [headers]
  */
 function refuseEarly(raw, incoming, scrub, status, body, headers) {
-  const drop = discardIncoming(incoming);
-  sendJson(raw, status, body, scrub, {
+  if (requestCarriesBody(incoming)) armEarlyClose(raw, incoming);
+  writeJson(raw, status, body, scrub, {
     ...(headers || {}),
     connection: 'close',
-  }, () => drop.flushed());
+  });
 }
 
 /**
@@ -768,10 +809,10 @@ function refuseOversized(raw, incoming, scrub) {
 
 /**
  * Drop the unread body. `flushed` runs once the response has been written.
- * Within 1 MiB and 5 seconds the socket is ended; past either limit it is destroyed.
- * The bytes are counted and discarded, never stored.
- * The deadline cannot close the socket before `flushed`. If the client never
- * reads the response, Node's request timeout is what ends it. Nothing is retained.
+ * Bytes are counted and discarded, never stored. Past 1 MiB or 5 seconds,
+ * or once the body ends inside that budget, the socket is destroyed.
+ * The deadline cannot destroy the socket before `flushed`, so the status
+ * line has left. Nothing is retained.
  * @param {import('node:http').IncomingMessage} req
  */
 function discardIncoming(req) {
@@ -802,7 +843,10 @@ function discardIncoming(req) {
     ended = true;
     settle();
   };
-  req.on('error', swallow);
+  req.on('error', () => {
+    ended = true;
+    settle();
+  });
   if (req.readableLength > DRAIN_MAX_BYTES) {
     over = true;
   } else if (req.readableEnded) {
@@ -826,8 +870,7 @@ function discardIncoming(req) {
     req.removeListener('close', onClose);
     if (!req.socket || req.socket.destroyed) return;
     req.socket.on('error', swallow);
-    if (over) req.destroy();
-    else req.socket.end();
+    req.destroy();
   }
 
   return {
@@ -839,6 +882,8 @@ function discardIncoming(req) {
 }
 
 /**
+ * Writes JSON. If the body is still unread, this is `refuseEarly`: no caller
+ * can answer early by using `sendJson` directly.
  * @param {import('node:http').ServerResponse} raw
  * @param {number} status
  * @param {unknown} body
@@ -847,6 +892,22 @@ function discardIncoming(req) {
  * @param {() => void} [done] Runs after the response is flushed.
  */
 function sendJson(raw, status, body, scrub, headers, done) {
+  if (!raw[kArmed] && requestCarriesBody(raw.req)) {
+    refuseEarly(raw, raw.req, scrub, status, body, headers);
+    return;
+  }
+  writeJson(raw, status, body, scrub, headers, done);
+}
+
+/**
+ * @param {import('node:http').ServerResponse} raw
+ * @param {number} status
+ * @param {unknown} body
+ * @param {(value: unknown) => unknown} scrub
+ * @param {Record<string, string>} [headers]
+ * @param {() => void} [done]
+ */
+function writeJson(raw, status, body, scrub, headers, done) {
   if (raw.writableEnded) {
     if (typeof done === 'function') done();
     return;
@@ -860,17 +921,94 @@ function sendJson(raw, status, body, scrub, headers, done) {
   raw.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     ...headers,
+    'content-length': Buffer.byteLength(payload),
   });
-  // Node treats `Connection: close` as the last message and ends the socket
-  // when the response finishes (`_last` / `shouldKeepAlive`, Node 22.23.4).
-  // The client can then see ECONNRESET instead of the JSON. Keep the socket
-  // up; discardIncoming ends it, or destroys it past 1 MiB or 5 seconds.
-  if (headers && headers.connection === 'close') {
-    raw.shouldKeepAlive = true;
-    raw._last = false;
-    if (raw.req) raw.req.shouldKeepAlive = true;
-  }
   raw.end(payload, () => {
     if (typeof done === 'function') done();
   });
+}
+
+/**
+ * The body has been read in full. Later responses may keep the connection.
+ * @param {import('node:http').IncomingMessage} req
+ */
+function markBodyConsumed(incoming) {
+  incoming[kBodyConsumed] = true;
+}
+
+/**
+ * A positive length or chunked framing means bytes may still be on the wire.
+ * @param {import('node:http').IncomingMessage | undefined} req
+ */
+function requestCarriesBody(req) {
+  if (!req || req[kBodyConsumed]) return false;
+  const length = declaredLength(req);
+  if (length !== null && length > 0) return true;
+  return headerValue(req, 'transfer-encoding').toLowerCase().includes('chunked');
+}
+
+/**
+ * Any write before the body is consumed takes the `refuseEarly` close:
+ * `Connection: close`, bounded discard, then `destroy()`.
+ * @param {import('node:http').ServerResponse} raw
+ */
+function installResponseGuard(raw) {
+  const originalWriteHead = raw.writeHead;
+  const originalEnd = raw.end;
+  raw[kOriginalEnd] = originalEnd;
+  raw.writeHead = function writeHead(...args) {
+    if (!raw[kArmed] && requestCarriesBody(raw.req)) armEarlyClose(raw, raw.req);
+    const result = originalWriteHead.apply(this, args);
+    if (raw[kArmed]) keepSocketUntilDrain(this);
+    return result;
+  };
+  const guardEnd = function end(...args) {
+    if (!raw[kArmed] && requestCarriesBody(raw.req)) armEarlyClose(raw, raw.req);
+    if (raw.end !== guardEnd) return raw.end(...args);
+    return originalEnd.apply(raw, args);
+  };
+  raw.end = guardEnd;
+}
+
+/**
+ * @param {import('node:http').ServerResponse} raw
+ * @param {import('node:http').IncomingMessage} incoming
+ */
+function armEarlyClose(raw, incoming) {
+  if (raw[kArmed]) return;
+  raw[kArmed] = true;
+  const originalEnd = raw[kOriginalEnd] || raw.end;
+  const drop = discardIncoming(incoming);
+  raw.end = function end(chunk, encoding, cb) {
+    let data = chunk;
+    let enc = encoding;
+    let callback = cb;
+    if (typeof data === 'function') {
+      callback = data;
+      data = undefined;
+      enc = undefined;
+    } else if (typeof enc === 'function') {
+      callback = enc;
+      enc = undefined;
+    }
+    keepSocketUntilDrain(this);
+    if (!this.headersSent && !this.getHeader('connection')) this.setHeader('connection', 'close');
+    return originalEnd.call(this, data, enc, () => {
+      drop.flushed();
+      if (typeof callback === 'function') callback();
+    });
+  };
+}
+
+/**
+ * Node treats `Connection: close` as the last message and ends the socket
+ * when the response finishes (`_last` / `shouldKeepAlive`, Node 22.23.4).
+ * The client can then see ECONNRESET instead of the JSON. Keep the socket
+ * up until `discardIncoming` destroys it.
+ * @param {import('node:http').ServerResponse} raw
+ */
+function keepSocketUntilDrain(raw) {
+  raw.shouldKeepAlive = true;
+  raw._last = false;
+  if (raw.req) raw.req.shouldKeepAlive = true;
 }

@@ -240,6 +240,8 @@ In this mode `summary` is null. The mission route used here does not carry one.
 
 Public paths keep the daemon limits: 60 requests a minute per address, a body of at most 64 KiB, and a cross-site POST is refused. The address is the socket peer. `X-Real-IP` is used only when `TIMON_MCP_TRUST_PROXY=1` and that peer is loopback, which is how the reverse proxy on this machine reaches the host. The proxy must set `proxy_set_header X-Real-IP $remote_addr;`. Any other value of the setting, or a peer that is not loopback, ignores the header. `X-Forwarded-For` is ignored. `GET /health` is not a public path.
 
+Any response sent before that body has been read leaves through one exit: `Connection: close`, then at most 1 MiB of the unread body is discarded over at most 5 seconds, then the socket is destroyed. That covers a non-public path, an unknown prefix, a method this host does not serve, a cross-site POST, a body past 64 KiB, a rate limit, and any later status written while the body is still unread. The server also stops incomplete headers after 10 seconds and an unfinished request after 30 seconds. An idle socket is closed after 30 seconds. Incomplete requests are checked every second, so those deadlines fire on time.
+
 An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=` and contains no secret. The operator replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together) and installs the unit. This package does not install it.
 
 ## Tests
