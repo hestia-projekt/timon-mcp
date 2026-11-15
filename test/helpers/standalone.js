@@ -46,9 +46,10 @@ export async function openStack(t, options = {}) {
       tokenFile: options.tokenFile ?? tokenFile,
       dbFile,
       settingsFile,
-      env: { [BEARER_SECRET]: bearer },
+      env: { [BEARER_SECRET]: bearer, ...(options.env ?? {}) },
       journal,
       logs,
+      now: options.now,
     });
   } catch (err) {
     if (daemon) await daemon.close();

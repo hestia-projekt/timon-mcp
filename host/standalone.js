@@ -39,9 +39,11 @@ const SETTING_KEYS = [
  * @param {string} [options.migrationsDir]
  * @param {Array<{ method: string, path: string, status: number }>} [options.journal]
  * @param {Array<{ level: string, message: string }>} [options.logs]
+ * @param {() => number} [options.now] Clock for the spawn quota. Tests inject it.
  */
 export async function startStandalone(options = {}) {
   const env = options.env ?? process.env;
+  const trustProxy = env.TIMON_MCP_TRUST_PROXY === '1';
   const origin = daemonOrigin(options, env);
   const port = listenPort(options, env);
   const tokenFile = options.tokenFile || env.TIMON_DAEMON_TOKEN_FILE || join(homedir(), '.timon', 'daemon-token');
@@ -130,6 +132,7 @@ export async function startStandalone(options = {}) {
       routers,
       buckets,
       scrub: client.scrub,
+      trustProxy,
     }).catch(() => {
       if (!raw.writableEnded) {
         try {
@@ -417,9 +420,10 @@ function safeJson(value) {
  * @param {Array<{ handle: Function }>} input.routers
  * @param {Map<string, { start: number, count: number }>} input.buckets
  * @param {(value: unknown) => unknown} input.scrub
+ * @param {boolean} input.trustProxy
  */
 async function handleHttp(input) {
-  const { incoming, raw, prefix, publicPaths, routers, buckets, scrub } = input;
+  const { incoming, raw, prefix, publicPaths, routers, buckets, scrub, trustProxy } = input;
   let url;
   try {
     url = new URL(incoming.url || '/', 'http://127.0.0.1');
@@ -448,7 +452,7 @@ async function handleHttp(input) {
     drain(incoming);
     return;
   }
-  const rate = takeRate(buckets, clientAddress(incoming), Date.now());
+  const rate = takeRate(buckets, clientAddress(incoming, trustProxy), Date.now());
   if (!rate.ok) {
     sendJson(raw, 429, { error: 'too many requests, try again later', code: 'too_many_attempts' }, scrub, {
       'retry-after': String(rate.retry),
@@ -594,13 +598,33 @@ function declaredLength(req) {
 }
 
 /**
- * Prefer the first trimmed `X-Real-IP`. Never `X-Forwarded-For`.
+ * Socket peer by default. `X-Real-IP` counts only when the operator set
+ * `TIMON_MCP_TRUST_PROXY=1` and the peer is loopback, so a client cannot
+ * pick its own rate bucket. `X-Forwarded-For` is never read.
  * @param {import('node:http').IncomingMessage} req
+ * @param {boolean} trustProxy
  */
-function clientAddress(req) {
+export function clientAddress(req, trustProxy) {
+  const peer = req.socket && typeof req.socket.remoteAddress === 'string' && req.socket.remoteAddress
+    ? req.socket.remoteAddress
+    : 'unknown';
+  if (!trustProxy || !isLoopback(peer)) return peer;
   const real = headerValue(req, 'x-real-ip').split(',')[0].trim();
-  if (real) return real;
-  return req.socket?.remoteAddress || 'unknown';
+  if (!real) return peer;
+  return real;
+}
+
+/**
+ * `127.0.0.0/8`, `::1`, and the IPv4-mapped forms Node reports for them.
+ * @param {string} address
+ */
+function isLoopback(address) {
+  if (address === '::1') return true;
+  const mapped = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+  if (mapped === '::1') return true;
+  const parts = mapped.split('.');
+  if (parts.length !== 4 || parts[0] !== '127') return false;
+  return parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
 }
 
 /**

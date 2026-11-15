@@ -162,13 +162,14 @@ Any TLS reverse proxy rewrites the public URLs onto the plugin prefix. `/.well-k
 
 ```nginx
 proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
 rewrite ^/.well-known/oauth-protected-resource$ /api/plugins/timon-mcp/oauth/protected-resource last;
 rewrite ^/.well-known/oauth-authorization-server$ /api/plugins/timon-mcp/oauth/authorization-server last;
 rewrite ^/oauth/(.*)$ /api/plugins/timon-mcp/oauth/$1 last;
 rewrite ^/mcp$ /api/plugins/timon-mcp/mcp last;
 ```
 
-The daemon compares `Origin` with `Host`. `proxy_set_header Host $host;` forwards the public host the client saw. Without that line the daemon would see the upstream address and refuse an `Origin` of the same site. `/mcp` must forward `Authorization` through to the daemon. Public paths clear the identity header at the edge, before the authentication proxy sets it, as above. `proxy_pass` to the daemon is an operator setting, not a value of the plugin.
+The daemon compares `Origin` with `Host`. `proxy_set_header Host $host;` forwards the public host the client saw. Without that line the daemon would see the upstream address and refuse an `Origin` of the same site. `proxy_set_header X-Real-IP $remote_addr;` replaces any client-supplied value with the address the proxy actually saw. `/mcp` must forward `Authorization` through to the daemon. Public paths clear the identity header at the edge, before the authentication proxy sets it, as above. `proxy_pass` to the daemon is an operator setting, not a value of the plugin.
 
 ## Clients
 
@@ -233,7 +234,7 @@ The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the l
 
 Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
 
-Public paths keep the daemon limits: 60 requests a minute per address, taken from `X-Real-IP`, a body of at most 64 KiB, and a cross-site POST is refused. `GET /health` is not a public path.
+Public paths keep the daemon limits: 60 requests a minute per address, a body of at most 64 KiB, and a cross-site POST is refused. The address is the socket peer. `X-Real-IP` is used only when `TIMON_MCP_TRUST_PROXY=1` and that peer is loopback, which is how the reverse proxy on this machine reaches the host. The proxy must set `proxy_set_header X-Real-IP $remote_addr;`. Any other value of the setting, or a peer that is not loopback, ignores the header. `X-Forwarded-For` is ignored. `GET /health` is not a public path.
 
 An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=` and contains no secret. The operator replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together) and installs the unit. This package does not install it.
 

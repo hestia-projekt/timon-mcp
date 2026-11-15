@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { BEARER_SECRET } from '../../lib/constants.js';
 import { DAEMON_ROUTES, createDaemonClient } from '../../host/daemon.js';
-import { startStandalone } from '../../host/standalone.js';
+import { clientAddress, startStandalone } from '../../host/standalone.js';
 import { startFakeDaemon } from '../helpers/fake-daemon.js';
 import { openStack } from '../helpers/standalone.js';
 
@@ -188,7 +188,7 @@ test('scope stays on missions and tasks this host created', async (t) => {
 });
 
 test('public guards match the daemon and health stays private', async (t) => {
-  const stack = await openStack(t, { daemon: false });
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
   assert.equal(stack.host.address, '127.0.0.1');
   const base = stack.host.baseUrl;
 
@@ -328,6 +328,40 @@ test('public guards match the daemon and health stays private', async (t) => {
     });
     assert.equal(stillOpen.status, 503);
   }
+});
+
+test('X-Real-IP is ignored unless the peer is a trusted loopback proxy', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: 'true' } });
+  for (let i = 0; i < 60; i += 1) {
+    const ok = await rawCall(stack.host.baseUrl, {
+      path: `${PREFIX}/oauth/protected-resource`,
+      headers: { 'x-real-ip': `203.0.113.${i % 40}` },
+    });
+    assert.equal(ok.status, 503);
+  }
+  const spoofed = await rawCall(stack.host.baseUrl, {
+    path: `${PREFIX}/oauth/protected-resource`,
+    headers: { 'x-real-ip': '198.51.100.20' },
+  });
+  assert.equal(spoofed.status, 429);
+
+  const remote = { headers: { 'x-real-ip': '198.51.100.8' }, socket: { remoteAddress: '203.0.113.4' } };
+  assert.equal(clientAddress(remote, true), '203.0.113.4');
+  const loop = { headers: { 'x-real-ip': '198.51.100.8, 203.0.113.1' }, socket: { remoteAddress: '127.0.0.1' } };
+  assert.equal(clientAddress(loop, false), '127.0.0.1');
+  assert.equal(clientAddress(loop, true), '198.51.100.8');
+  assert.equal(clientAddress({
+    headers: { 'x-forwarded-for': '198.51.100.9', 'x-real-ip': '198.51.100.8' },
+    socket: { remoteAddress: '::1' },
+  }, true), '198.51.100.8');
+  assert.equal(clientAddress({
+    headers: { 'x-real-ip': '203.0.113.9' },
+    socket: { remoteAddress: '::ffff:127.0.0.1' },
+  }, true), '203.0.113.9');
+  assert.equal(clientAddress({
+    headers: { 'x-real-ip': '203.0.113.9' },
+    socket: { remoteAddress: '::ffff:203.0.113.4' },
+  }, true), '::ffff:203.0.113.4');
 });
 
 test('a forwarded-for header does not pick the rate bucket', async (t) => {
