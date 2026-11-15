@@ -26,7 +26,10 @@ test('node:sqlite is required from Node.js 22.13', () => {
   assert.equal(nodeSupportsSqlite('v22.13.0'), true);
   assert.equal(nodeSupportsSqlite('22.13.1'), true);
   assert.equal(nodeSupportsSqlite('22.23.4'), true);
-  assert.equal(nodeSupportsSqlite('23.0.0'), true);
+  assert.equal(nodeSupportsSqlite('23.0.0'), false);
+  assert.equal(nodeSupportsSqlite('23.3.9'), false);
+  assert.equal(nodeSupportsSqlite('23.4.0'), true);
+  assert.equal(nodeSupportsSqlite('24.0.0'), true);
   const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   const [major, minor] = MIN_STANDALONE_NODE;
   assert.equal(pkg.engines.node, `>=${major}.${minor}`);

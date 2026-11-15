@@ -18,6 +18,16 @@ const PROJECT = new RegExp(PROJECT_PATTERN);
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 /** Ids fetched per list. Both statements apply this bound in SQL. */
 const LIST_GET_MAX = 50;
+/**
+ * Wall-clock budget for one `list`, checked before each daemon read.
+ * Fifty ids read in series can spend 20 seconds on each call
+ * (`AbortSignal.timeout` in `host/daemon.js`) and would outlive
+ * `server.timeout`. One read already in flight may still finish inside
+ * that cap, which keeps the whole list under the idle limit. Past this
+ * budget the call throws a typed timeout instead of returning the rows
+ * gathered so far. A test may pass a smaller `listBudgetMs`.
+ */
+export const LIST_BUDGET_MS = 60_000;
 const SPAWN_MAX_DEFAULT = 5;
 const SPAWN_WINDOW_DEFAULT = 3_600_000;
 const MISSION_KEYS = new Set(['agent', 'mission']);
@@ -87,6 +97,7 @@ function readQuota(raw, fallback, name) {
  * @param {{ request: Function }} deps.client
  * @param {{ prepare: Function }} deps.sql
  * @param {{ take: Function }} deps.quota
+ * @param {number} [deps.listBudgetMs] Test override for `LIST_BUDGET_MS`.
  */
 export function createMissionFacade(deps) {
   const { client, sql, quota } = deps;
@@ -156,11 +167,13 @@ export function createMissionFacade(deps) {
     async list(opts = {}) {
       const limit = boundedLimit(opts.limit, 50, () => new PluginMissionError('invalid', 'limit is invalid'));
       const status = typeof opts.status === 'string' ? opts.status : undefined;
+      const beforeRead = listBudget(deps.listBudgetMs, () => new PluginMissionError('timeout', 'list timed out'));
       /** @type {Record<string, unknown>[]} */
       const rows = [];
       for (const row of listed.all(LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
+        beforeRead();
         const result = await callMission(() => client.request('GET', `/api/missions/${id}`));
         if (result.status === 404) {
           forget.run(id);
@@ -184,6 +197,7 @@ export function createMissionFacade(deps) {
  * @param {{ request: Function }} deps.client
  * @param {{ prepare: Function }} deps.sql
  * @param {{ take: Function }} deps.quota
+ * @param {number} [deps.listBudgetMs] Test override for `LIST_BUDGET_MS`.
  */
 export function createTaskFacade(deps) {
   const { client, sql, quota } = deps;
@@ -217,11 +231,13 @@ export function createTaskFacade(deps) {
       const limit = boundedLimit(opts.limit, 100, () => new PluginTaskError('invalid', 'limit is invalid'));
       const status = typeof opts.status === 'string' ? opts.status : undefined;
       const project = typeof opts.project === 'string' ? opts.project : undefined;
+      const beforeRead = listBudget(deps.listBudgetMs, () => new PluginTaskError('timeout', 'list timed out'));
       /** @type {Record<string, unknown>[]} */
       const rows = [];
       for (const row of listed.all(LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
+        beforeRead();
         const result = await callTask(() => client.request('GET', `/api/tasks/${id}`));
         if (result.status === 404) {
           forget.run(id);
@@ -383,6 +399,20 @@ function requireOwned(owned, id) {
 function safeId(value) {
   if (typeof value !== 'string' || !ID_PATTERN.test(value)) return null;
   return value;
+}
+
+/**
+ * Deadline for one list. `listBudgetMs` is a test override; production uses
+ * `LIST_BUDGET_MS`. The check runs before each daemon read.
+ * @param {number | undefined} raw
+ * @param {() => Error} timeout
+ */
+function listBudget(raw, timeout) {
+  const budget = typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : LIST_BUDGET_MS;
+  const deadline = Date.now() + budget;
+  return function beforeRead() {
+    if (Date.now() >= deadline) throw timeout();
+  };
 }
 
 /**

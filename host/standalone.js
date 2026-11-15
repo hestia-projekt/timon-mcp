@@ -29,14 +29,17 @@ const DRAIN_MAX_MS = 5_000;
  *
  * `SOCKET_TIMEOUT_MS` is inactivity on the socket (`server.timeout`). With no
  * `timeout` listener, Node destroys the socket when it elapses, in either
- * direction. `wait` writes nothing for up to `WAIT_MAX_S` seconds. The
- * handler can then call the daemon, which is capped at 20 seconds by
- * `AbortSignal.timeout(20_000)` in `host/daemon.js`. The idle limit is that
- * sum plus `SOCKET_TIMEOUT_MARGIN_MS`, so a legal `wait` (31 to 50 seconds,
- * including the 25 second default followed by a slow daemon read) returns
- * JSON instead of `ECONNRESET`. A slow read is still bounded. Incomplete
- * requests are checked every `CONNECTIONS_CHECK_MS`, which is what makes
- * the header and request deadlines fire on time.
+ * direction. `wait` writes nothing while it runs, for up to `WAIT_MAX_S`
+ * seconds. In `waitForTurn` that countdown starts only after an initial
+ * daemon read. A poll can still be in flight when the countdown ends, and a
+ * final read always follows. Each of those three reads is capped at
+ * `DAEMON_CALL_TIMEOUT_S` by `AbortSignal.timeout(20_000)` in
+ * `host/daemon.js`. The idle limit is `WAIT_MAX_S` plus those three reads,
+ * plus `SOCKET_TIMEOUT_MARGIN_MS`: 20 + 50 + 20 + 20 seconds, then 10 seconds
+ * of slack, so a daemon that stays under its own cap returns JSON instead of
+ * `ECONNRESET`. A slow read is still bounded. Incomplete requests are
+ * checked every `CONNECTIONS_CHECK_MS`, which is what makes the header and
+ * request deadlines fire on time.
  */
 const HEADERS_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -44,7 +47,10 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const DAEMON_CALL_TIMEOUT_S = 20;
 /** Slack so the idle timer cannot fire on the same tick as that budget. */
 const SOCKET_TIMEOUT_MARGIN_MS = 10_000;
-const SOCKET_TIMEOUT_MS = (WAIT_MAX_S + DAEMON_CALL_TIMEOUT_S) * 1000 + SOCKET_TIMEOUT_MARGIN_MS;
+/** Initial read, poll still in flight at the deadline, and the final read. */
+const WAIT_DAEMON_READS = 3;
+const SOCKET_TIMEOUT_MS = (WAIT_MAX_S + WAIT_DAEMON_READS * DAEMON_CALL_TIMEOUT_S) * 1000
+  + SOCKET_TIMEOUT_MARGIN_MS;
 const CONNECTIONS_CHECK_MS = 1_000;
 /** Methods this host will route. Any other method is a 405 before the body is read. */
 const SERVED_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT']);

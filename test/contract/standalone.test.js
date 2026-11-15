@@ -724,12 +724,14 @@ test('every early refusal closes a stalled body', async (t) => {
 
 test('the socket idle timeout outlasts the longest wait', async (t) => {
   const stack = await openStack(t, { daemon: false });
-  const floor = (WAIT_MAX_S + 20) * 1000;
-  assert.equal(typeof stack.host.socketTimeoutMs, 'number');
-  assert.ok(stack.host.socketTimeoutMs >= floor, String(stack.host.socketTimeoutMs));
-  // 70s is the legal silence. 75s forces a margin so the idle timer cannot
-  // fire on the same tick as the daemon call that follows `wait`.
-  assert.ok(stack.host.socketTimeoutMs >= 75_000, String(stack.host.socketTimeoutMs));
+  // Initial read, a poll still in flight when the countdown ends, and the
+  // final read. Each daemon call is 20s. 10s of margin keeps the idle timer
+  // off the tick of that last read. 50 + 3 * 20 seconds, plus 10s, is 120s.
+  const daemonCallS = 20;
+  const marginMs = 10_000;
+  const floor = (WAIT_MAX_S + 3 * daemonCallS) * 1000 + marginMs;
+  assert.equal(floor, 120_000);
+  assert.equal(stack.host.socketTimeoutMs, floor);
 });
 
 test('slow headers are closed by the server timeout', async (t) => {
