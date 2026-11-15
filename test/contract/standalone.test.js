@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { BEARER_SECRET } from '../../lib/constants.js';
+import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
 import { DAEMON_ROUTES, createDaemonClient } from '../../host/daemon.js';
 import { clientAddress, startStandalone } from '../../host/standalone.js';
 import { startFakeDaemon } from '../helpers/fake-daemon.js';
@@ -132,8 +132,8 @@ test('scope stays on missions and tasks this host created', async (t) => {
   daemon.missions.delete(second);
   const afterGone = await host.ctx.missions.list();
   assert.equal(afterGone.some((row) => row.id === second), false);
-  const kept = host.ctx.sql.prepare('SELECT id FROM host_missions WHERE id = ?').get(second);
-  assert.equal(kept.id, second);
+  const forgotten = host.ctx.sql.prepare('SELECT id FROM host_missions WHERE id = ?').get(second);
+  assert.equal(forgotten, undefined);
 
   const sent = await host.ctx.missions.send(missionId, 'follow up');
   assert.deepEqual(sent, { resumed: false });
@@ -328,6 +328,157 @@ test('public guards match the daemon and health stays private', async (t) => {
     });
     assert.equal(stillOpen.status, 503);
   }
+});
+
+test('spawn, send and task creation share a ceiling and stop before the daemon', async (t) => {
+  const stack = await openStack(t, { env: { TIMON_MCP_SPAWN_MAX: '1' } });
+  const missionId = await stack.host.ctx.missions.spawn({ agent: '_main', mission: 'one' });
+  const calls = stack.daemon.requests.length;
+  await assert.rejects(
+    () => stack.host.ctx.missions.send(missionId, 'more'),
+    (err) => err.name === 'PluginPolicyError' && err.rule === 'spawn',
+  );
+  await assert.rejects(
+    () => stack.host.ctx.kanban.add({
+      project: 'alpha', title: 'T', description: 'D', agent: 'alpha.main', type: 'chore',
+    }),
+    (err) => err.name === 'PluginPolicyError' && err.rule === 'spawn',
+  );
+  assert.equal(stack.daemon.requests.length, calls);
+
+  const refused = await rpc(stack, 'tools/call', {
+    name: 'ask_main',
+    arguments: { message: 'over the ceiling' },
+  });
+  assert.equal(refused.body.result.isError, true);
+  assert.equal(refused.body.result.content[0].text, APPROVAL_MESSAGE);
+  const task = await rpc(stack, 'tools/call', {
+    name: 'create_task',
+    arguments: { project: 'alpha', title: 'Notes', description: 'details' },
+  });
+  assert.equal(task.body.result.isError, true);
+  assert.equal(task.body.result.content[0].text, APPROVAL_MESSAGE);
+  assert.equal(stack.daemon.requests.length, calls);
+  assert.equal(stack.daemon.requests.some((row) => row.path === '/api/tasks'), false);
+  assert.equal(stack.daemon.requests.some((row) => row.path.endsWith('/send')), false);
+});
+
+test('the spawn ceiling slides forward with the window', async (t) => {
+  let now = 0;
+  const stack = await openStack(t, {
+    env: { TIMON_MCP_SPAWN_MAX: '1', TIMON_MCP_SPAWN_WINDOW_MS: '1000' },
+    now: () => now,
+  });
+  await stack.host.ctx.missions.spawn({ agent: '_main', mission: 'first' });
+  const afterFirst = stack.daemon.requests.length;
+  now = 999;
+  await assert.rejects(
+    () => stack.host.ctx.missions.spawn({ agent: '_main', mission: 'early' }),
+    (err) => err.name === 'PluginPolicyError' && err.rule === 'spawn',
+  );
+  assert.equal(stack.daemon.requests.length, afterFirst);
+  now = 1000;
+  await stack.host.ctx.missions.spawn({ agent: '_main', mission: 'later' });
+  const posts = stack.daemon.requests.filter((row) => row.method === 'POST' && row.path === '/api/missions');
+  assert.equal(posts.length, 2);
+});
+
+test('list reads at most the 50 newest ids and forgets a 404', async (t) => {
+  const stack = await openStack(t);
+  const insertMission = stack.host.ctx.sql.prepare(
+    'INSERT INTO host_missions (id, agent_name, created_at) VALUES (?, ?, ?)',
+  );
+  const insertTask = stack.host.ctx.sql.prepare(
+    'INSERT INTO host_tasks (id, project, agent_name, title, created_at) VALUES (?, ?, ?, ?, ?)',
+  );
+  for (let i = 0; i < 51; i += 1) {
+    const id = `m${String(i).padStart(3, '0')}`;
+    insertMission.run(id, '_main', i + 1);
+    insertTask.run(`t${String(i).padStart(3, '0')}`, 'alpha', 'alpha.main', 't', i + 1);
+  }
+  const before = stack.daemon.requests.length;
+  const missions = await stack.host.ctx.missions.list();
+  const tasks = await stack.host.ctx.kanban.list();
+  const gets = stack.daemon.requests.slice(before).filter((row) => row.method === 'GET');
+  assert.equal(missions.length, 0);
+  assert.equal(tasks.length, 0);
+  assert.equal(gets.length, 100);
+  assert.equal(gets.filter((row) => row.path.startsWith('/api/missions/')).length, 50);
+  assert.equal(gets.filter((row) => row.path.startsWith('/api/tasks/')).length, 50);
+  assert.equal(gets.some((row) => row.path.endsWith('/m000')), false);
+  assert.equal(gets.some((row) => row.path.endsWith('/m050')), true);
+  assert.equal(gets.some((row) => row.path.endsWith('/t000')), false);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_missions WHERE id = ?').get('m000').id, 'm000');
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_missions WHERE id = ?').get('m050'), undefined);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_tasks WHERE id = ?').get('t000').id, 't000');
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_tasks WHERE id = ?').get('t050'), undefined);
+});
+
+test('a failed start names the cause and leaves the secret out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'timon-mcp-start-'));
+  const secret = randomBytes(32).toString('hex');
+  const env = { ...process.env };
+  delete env.TIMON_MCP_BEARER_TOKEN;
+  env.TIMON_MCP_BEARER_TOKEN = secret;
+  env.TIMON_MCP_PORT = 'nope';
+  env.TIMON_DAEMON_URL = 'http://127.0.0.1:9';
+  env.TIMON_DAEMON_TOKEN_FILE = join(dir, 'token');
+  env.TIMON_MCP_DB = join(dir, 'state.db');
+  const child = spawn(process.execPath, [join(ROOT, 'bin/timon-mcp-standalone.js')], {
+    cwd: ROOT,
+    env,
+    timeout: 4000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve) => child.on('exit', resolve));
+  rmSync(dir, { recursive: true, force: true });
+  assert.equal(code, 1);
+  assert.match(stderr, /TIMON_MCP_PORT is invalid/);
+  assert.equal(stdout.includes(secret), false);
+  assert.equal(stderr.includes(secret), false);
+});
+
+test('a declared oversized body is refused without reading it', async (t) => {
+  const stack = await openStack(t, { daemon: false, env: { TIMON_MCP_TRUST_PROXY: '1' } });
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for 413')), 1500);
+    const req = httpRequest({
+      hostname: '127.0.0.1',
+      port: stack.host.port,
+      path: `${PREFIX}/mcp`,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(1024 * 1024),
+        'x-real-ip': '203.0.113.77',
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      const done = () => {
+        clearTimeout(timer);
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+        resolve({ status: res.statusCode, json });
+      };
+      res.on('end', done);
+      res.on('aborted', done);
+    });
+    req.on('error', (err) => {
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+    req.write('{}');
+  });
+  assert.equal(result.status, 413);
+  assert.equal(result.json.code, 'payload_too_large');
 });
 
 test('X-Real-IP is ignored unless the peer is a trusted loopback proxy', async (t) => {
@@ -539,6 +690,18 @@ test('importing the cli does not listen', async () => {
 function rawCall(baseUrl, options = {}) {
   const url = new URL(options.path || '/', baseUrl);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let responseStarted = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const fail = (err) => {
+      if (settled || responseStarted) return;
+      settled = true;
+      reject(err);
+    };
     const req = httpRequest({
       hostname: url.hostname,
       port: url.port,
@@ -546,16 +709,19 @@ function rawCall(baseUrl, options = {}) {
       method: options.method || 'GET',
       headers: options.headers,
     }, (res) => {
+      responseStarted = true;
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => {
+      const done = () => {
         const text = Buffer.concat(chunks).toString('utf8');
         let json = null;
         try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-        resolve({ status: res.statusCode, headers: res.headers, text, json });
-      });
+        finish({ status: res.statusCode, headers: res.headers, text, json });
+      };
+      res.on('end', done);
+      res.on('aborted', done);
     });
-    req.on('error', reject);
+    req.on('error', fail);
     if (options.body) req.write(options.body);
     req.end();
   });

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { BEARER_SECRET, PLUGIN_ID } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
 import { createDaemonClient, resolveDaemonOrigin } from './daemon.js';
-import { createMissionFacade, createTaskFacade } from './facades.js';
+import { createMissionFacade, createSpawnQuota, createTaskFacade } from './facades.js';
 import { createResponse, createRouter } from './router.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -44,6 +44,7 @@ const SETTING_KEYS = [
 export async function startStandalone(options = {}) {
   const env = options.env ?? process.env;
   const trustProxy = env.TIMON_MCP_TRUST_PROXY === '1';
+  const quota = createSpawnQuota(env, typeof options.now === 'function' ? options.now : Date.now);
   const origin = daemonOrigin(options, env);
   const port = listenPort(options, env);
   const tokenFile = options.tokenFile || env.TIMON_DAEMON_TOKEN_FILE || join(homedir(), '.timon', 'daemon-token');
@@ -77,8 +78,8 @@ export async function startStandalone(options = {}) {
       routers.push(router);
       return router;
     },
-    missions: createMissionFacade({ client, sql }),
-    kanban: createTaskFacade({ client, sql }),
+    missions: createMissionFacade({ client, sql, quota }),
+    kanban: createTaskFacade({ client, sql, quota }),
     events: {
       /**
        * @param {unknown} kind
@@ -448,8 +449,9 @@ async function handleHttp(input) {
   }
   const declared = declaredLength(incoming);
   if (declared !== null && declared > PUBLIC_BODY_MAX) {
-    sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub);
-    drain(incoming);
+    sendJson(raw, 413, { error: 'request body too large', code: 'payload_too_large' }, scrub, undefined, () => {
+      incoming.destroy();
+    });
     return;
   }
   const rate = takeRate(buckets, clientAddress(incoming, trustProxy), Date.now());
@@ -697,9 +699,13 @@ function drain(req) {
  * @param {unknown} body
  * @param {(value: unknown) => unknown} scrub
  * @param {Record<string, string>} [headers]
+ * @param {() => void} [done] Runs after the response is flushed.
  */
-function sendJson(raw, status, body, scrub, headers) {
-  if (raw.writableEnded) return;
+function sendJson(raw, status, body, scrub, headers, done) {
+  if (raw.writableEnded) {
+    if (typeof done === 'function') done();
+    return;
+  }
   let payload = '{"error":"internal_error"}';
   try {
     payload = JSON.stringify(scrub(body));
@@ -710,5 +716,7 @@ function sendJson(raw, status, body, scrub, headers) {
     'content-type': 'application/json; charset=utf-8',
     ...headers,
   });
-  raw.end(payload);
+  raw.end(payload, () => {
+    if (typeof done === 'function') done();
+  });
 }

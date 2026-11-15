@@ -5,7 +5,7 @@
  * transport: five daemon routes, and only ids this host has created. Nothing
  * here is imported by `lib/`.
  */
-import { MESSAGE_MAX_CHARS, PILOT_AGENT, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
+import { APPROVAL_MESSAGE, MESSAGE_MAX_CHARS, PILOT_AGENT, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
 import {
   DaemonCallError,
   DaemonRouteError,
@@ -16,6 +16,10 @@ import {
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+/** Newest rows only. Listing must not walk the whole table. */
+const LIST_GET_MAX = 50;
+const SPAWN_MAX_DEFAULT = 5;
+const SPAWN_WINDOW_DEFAULT = 3_600_000;
 const MISSION_KEYS = new Set(['agent', 'mission']);
 const TASK_KEYS = new Set(['project', 'title', 'description', 'agent', 'type']);
 const OVERRIDE_EXACT = new Set([
@@ -34,17 +38,64 @@ const OVERRIDE_EXACT = new Set([
 ]);
 
 /**
+ * One sliding window for `spawn`, `send` and `kanban.add`.
+ * The daemon token is a super-administrator, so the plugin spawn policy
+ * does not apply here. Past the ceiling the facade throws `PluginPolicyError`
+ * with rule `spawn`, before any network call.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {() => number} [now]
+ */
+export function createSpawnQuota(env, now = Date.now) {
+  const max = readQuota(env.TIMON_MCP_SPAWN_MAX, SPAWN_MAX_DEFAULT, 'TIMON_MCP_SPAWN_MAX');
+  const windowMs = readQuota(env.TIMON_MCP_SPAWN_WINDOW_MS, SPAWN_WINDOW_DEFAULT, 'TIMON_MCP_SPAWN_WINDOW_MS');
+  /** @type {number[]} */
+  const stamps = [];
+  return {
+    take() {
+      const time = now();
+      let live = 0;
+      for (let i = 0; i < stamps.length; i += 1) {
+        if (time - stamps[i] < windowMs) {
+          stamps[live] = stamps[i];
+          live += 1;
+        }
+      }
+      stamps.length = live;
+      if (live >= max) {
+        throw new PluginPolicyError(PLUGIN_ID, 'spawn', APPROVAL_MESSAGE);
+      }
+      stamps.push(time);
+    },
+  };
+}
+
+/**
+ * @param {unknown} raw
+ * @param {number} fallback
+ * @param {string} name
+ */
+function readQuota(raw, fallback, name) {
+  if (raw === undefined || raw === '') return fallback;
+  if (typeof raw !== 'string' || !/^[1-9]\d*$/.test(raw)) throw new Error(`${name} is invalid`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} is invalid`);
+  return value;
+}
+
+/**
  * @param {object} deps
  * @param {{ request: Function }} deps.client
  * @param {{ prepare: Function }} deps.sql
+ * @param {{ take: Function }} deps.quota
  */
 export function createMissionFacade(deps) {
-  const { client, sql } = deps;
+  const { client, sql, quota } = deps;
   const owned = sql.prepare('SELECT id FROM host_missions WHERE id = ?');
   const insert = sql.prepare(
     'INSERT INTO host_missions (id, agent_name, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING',
   );
   const listed = sql.prepare('SELECT id FROM host_missions ORDER BY created_at DESC, id DESC');
+  const forget = sql.prepare('DELETE FROM host_missions WHERE id = ?');
 
   return {
     /**
@@ -53,6 +104,7 @@ export function createMissionFacade(deps) {
      */
     async spawn(input) {
       const body = missionBody(input);
+      takeSpawn(quota);
       const result = await callMission(() => client.request('POST', '/api/missions', body));
       if ((result.status !== 201 && result.status !== 200) || !result.json || typeof result.json !== 'object') {
         throw missionHttpError(result.status, result.json);
@@ -72,6 +124,7 @@ export function createMissionFacade(deps) {
       if (typeof text !== 'string' || !text || text.length > MESSAGE_MAX_CHARS) {
         throw new PluginMissionError('invalid', 'text is required');
       }
+      takeSpawn(quota);
       const result = await callMission(() => client.request('POST', `/api/agents/${id}/send`, { input: text }));
       if (result.status === 200 && result.json && typeof result.json === 'object' && result.json.ok === true) {
         return { resumed: result.json.resumed === true };
@@ -103,11 +156,14 @@ export function createMissionFacade(deps) {
       const status = typeof opts.status === 'string' ? opts.status : undefined;
       /** @type {Record<string, unknown>[]} */
       const rows = [];
-      for (const row of listed.all()) {
+      for (const row of listed.all().slice(0, LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
         const result = await callMission(() => client.request('GET', `/api/missions/${id}`));
-        if (result.status === 404) continue;
+        if (result.status === 404) {
+          forget.run(id);
+          continue;
+        }
         if (result.status !== 200 || !result.json || typeof result.json !== 'object') {
           throw missionHttpError(result.status, result.json);
         }
@@ -125,14 +181,16 @@ export function createMissionFacade(deps) {
  * @param {object} deps
  * @param {{ request: Function }} deps.client
  * @param {{ prepare: Function }} deps.sql
+ * @param {{ take: Function }} deps.quota
  */
 export function createTaskFacade(deps) {
-  const { client, sql } = deps;
+  const { client, sql, quota } = deps;
   const owned = sql.prepare('SELECT id FROM host_tasks WHERE id = ?');
   const insert = sql.prepare(
     'INSERT INTO host_tasks (id, project, agent_name, title, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING',
   );
   const listed = sql.prepare('SELECT id FROM host_tasks ORDER BY created_at DESC, id DESC');
+  const forget = sql.prepare('DELETE FROM host_tasks WHERE id = ?');
 
   return {
     /**
@@ -157,11 +215,14 @@ export function createTaskFacade(deps) {
       const project = typeof opts.project === 'string' ? opts.project : undefined;
       /** @type {Record<string, unknown>[]} */
       const rows = [];
-      for (const row of listed.all()) {
+      for (const row of listed.all().slice(0, LIST_GET_MAX)) {
         const id = safeId(row && row.id);
         if (!id) continue;
         const result = await callTask(() => client.request('GET', `/api/tasks/${id}`));
-        if (result.status === 404) continue;
+        if (result.status === 404) {
+          forget.run(id);
+          continue;
+        }
         const task = taskRecord(result);
         if (!task) throw taskHttpError(result.status, result.json);
         const picked = pickTask(task);
@@ -178,6 +239,7 @@ export function createTaskFacade(deps) {
      */
     async add(input) {
       const body = taskBody(input);
+      takeSpawn(quota);
       const result = await callTask(() => client.request('POST', '/api/tasks', body));
       const task = result.status === 201 ? taskRecord(result) : null;
       if (!task) throw taskHttpError(result.status, result.json);
@@ -209,6 +271,14 @@ function missionBody(input) {
     throw new PluginMissionError('invalid', 'mission is required');
   }
   return { agent, mission };
+}
+
+/**
+ * Validation has already passed. The slot stays taken if the daemon call fails.
+ */
+function takeSpawn(quota) {
+  if (!quota || typeof quota.take !== 'function') throw new Error('spawn quota is required');
+  quota.take();
 }
 
 /**

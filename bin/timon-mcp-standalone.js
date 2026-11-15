@@ -18,10 +18,22 @@ if (isDirectRun()) {
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
-  }, () => {
-    process.stderr.write('timon-mcp standalone failed to start\n');
+  }, (err) => {
+    process.stderr.write(`timon-mcp standalone failed to start: ${publicCause(err)}\n`);
     process.exit(1);
   });
+}
+
+/**
+ * A short fixed cause. Paths, stacks and anything that could carry a secret stay out.
+ * @param {unknown} err
+ */
+function publicCause(err) {
+  const message = err instanceof Error ? err.message : '';
+  if (message.length > 200 || message.length === 0) return 'startup failed';
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ,.'():_-]*$/.test(message)) return 'startup failed';
+  if (/[0-9a-f]{16,}/i.test(message)) return 'startup failed';
+  return message;
 }
 
 /**

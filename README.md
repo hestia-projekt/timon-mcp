@@ -232,7 +232,11 @@ The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the po
 
 The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
 
-Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
+Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. A list reads at most the 50 newest recorded ids. An id the daemon answers with 404 is dropped from that record. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
+
+`spawn`, `send` and task creation share one sliding window. `TIMON_MCP_SPAWN_MAX` is how many of those calls are allowed (default 5). `TIMON_MCP_SPAWN_WINDOW_MS` is the window in milliseconds (default 3600000). Past the ceiling the tool result is `isError`, with the text `waiting for the operator's approval`, and the daemon is not called. The daemon token is a super-administrator, so this ceiling is the host's own quota.
+
+In this mode `summary` is null. The mission route used here does not carry one.
 
 Public paths keep the daemon limits: 60 requests a minute per address, a body of at most 64 KiB, and a cross-site POST is refused. The address is the socket peer. `X-Real-IP` is used only when `TIMON_MCP_TRUST_PROXY=1` and that peer is loopback, which is how the reverse proxy on this machine reaches the host. The proxy must set `proxy_set_header X-Real-IP $remote_addr;`. Any other value of the setting, or a peer that is not loopback, ignores the header. `X-Forwarded-For` is ignored. `GET /health` is not a public path.
 
