@@ -4,7 +4,8 @@
  * creates only a chore for `<project>.main`.
  *
  * `done_comment` is the comment field `PUT /api/tasks/:id` accepts in release
- * 0.1.8. That release stores it when the same request changes the status.
+ * 0.1.8. That release stores it only when the same request changes the status,
+ * so a comment is a field of `move_task` and not its own tool.
  * `blocked_reason` is the reason stored for `BLOCKED`. There is no delete.
  */
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
@@ -42,7 +43,7 @@ export const KANBAN_TOOLS = [
   {
     name: 'list_all_tasks',
     ...schema(
-      'Lists tasks on this Timon. Filters: project, agent (`_main` or `<project>.<role>`), status (PENDING, IN_PROGRESS, DONE, BLOCKED), and type (code, review, merge, research, doc, chore). Only status is sent to the daemon. The description, the comment, overrides, and paths are not returned.',
+      'Lists tasks on this Timon. Filters: project, agent (`_main` or `<project>.<role>`), status (PENDING, IN_PROGRESS, DONE, BLOCKED), and type (code, review, merge, research, doc, chore). Release 0.1.8 has no limit, project, agent, type, or pagination on GET /api/tasks: only status is sent, and project, agent, and type are applied after the body is read. A body past 8 MiB fails with too_large; pass status, or read one task with get_task. The description, the comment, overrides, and paths are not returned.',
       {
         project: projectName,
         agent: agentName,
@@ -127,7 +128,7 @@ export const KANBAN_TOOLS = [
   {
     name: 'move_task',
     ...schema(
-      'Sets the status of one task. BLOCKED requires reason (stored as blocked_reason). Optional comment is sent as done_comment in the same request, which is when release 0.1.8 stores that field. Does not count against the host spawn window.',
+      'Sets the status of one task. BLOCKED requires reason (stored as blocked_reason). Optional comment is sent as done_comment in the same request. Release 0.1.8 stores that field only when the status value changes. Does not count against the host spawn window.',
       {
         task_id: taskId,
         status: { type: 'string', enum: [...TASK_STATUS_NAMES] },
@@ -145,21 +146,6 @@ export const KANBAN_TOOLS = [
       const patch = { ...args };
       delete patch.task_id;
       return ctx.kanban.move(taskId, patch);
-    },
-  },
-  {
-    name: 'comment_task',
-    ...schema(
-      'Writes done_comment through PUT /api/tasks/:id, the comment field that route accepts. Release 0.1.8 stores this field when the same request also changes the status. To store a comment with a move, pass comment to move_task. No other field is sent. Does not count against the host spawn window.',
-      { task_id: taskId, comment: note },
-      ['task_id', 'comment'],
-    ),
-    /**
-     * @param {object} ctx
-     * @param {Record<string, unknown>} args
-     */
-    run(ctx, args) {
-      return ctx.kanban.comment(args.task_id, args.comment);
     },
   },
 ];

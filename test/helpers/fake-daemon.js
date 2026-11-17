@@ -23,6 +23,8 @@ export async function startFakeDaemon(options) {
   const tasks = new Map();
   /** @type {{ status: number, body?: unknown, redirect?: boolean } | null} */
   let failNext = null;
+  /** @type {unknown} */
+  let taskListOverride = null;
 
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
@@ -194,6 +196,10 @@ export async function startFakeDaemon(options) {
       return;
     }
     if (method === 'GET' && url.pathname === '/api/tasks') {
+      if (taskListOverride !== null) {
+        send(res, 200, taskListOverride);
+        return;
+      }
       const status = url.searchParams.get('status');
       let rows = [...tasks.values()];
       if (status) rows = rows.filter((row) => row.status === status);
@@ -236,9 +242,14 @@ export async function startFakeDaemon(options) {
       if (typeof body.agent_name === 'string') task.agent_name = body.agent_name;
       if (Number.isInteger(body.priority)) task.priority = body.priority;
       if (Array.isArray(body.deps)) task.deps = JSON.stringify(body.deps);
-      if (typeof body.status === 'string') task.status = body.status;
-      if (typeof body.blocked_reason === 'string') task.blocked_reason = body.blocked_reason;
-      if (typeof body.done_comment === 'string') task.done_comment = body.done_comment;
+      // Release 0.1.8 writes `done_comment` and `blocked_reason` only inside the
+      // status transition. A comment alone, or the same status again, changes
+      // neither. A real transition stores both, and an omitted one becomes null.
+      if (typeof body.status === 'string' && body.status !== task.status) {
+        task.status = body.status;
+        task.done_comment = typeof body.done_comment === 'string' ? body.done_comment : null;
+        task.blocked_reason = typeof body.blocked_reason === 'string' ? body.blocked_reason : null;
+      }
       task.updated_at = Date.now();
       send(res, 200, { task });
       return;
@@ -275,6 +286,12 @@ export async function startFakeDaemon(options) {
      * @param {{ status: number, body?: unknown, redirect?: boolean }} next
      */
     failNext(next) { failNext = next; },
+    /**
+     * Body of the next `GET /api/tasks`, instead of the stored rows.
+     * `null` restores the stored rows. The status query is still recorded.
+     * @param {unknown} body
+     */
+    setTaskList(body) { taskListOverride = body; },
     close() {
       return new Promise((resolve) => {
         server.close(() => resolve());

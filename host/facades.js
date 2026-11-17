@@ -7,7 +7,9 @@
  * Nothing here is imported by `lib/`.
  */
 import { APPROVAL_MESSAGE, MESSAGE_MAX_CHARS, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
+import { TASK_LIST_TOO_LARGE } from './daemon.js';
 import {
+  DaemonBodyError,
   DaemonCallError,
   DaemonRouteError,
   PluginMissionError,
@@ -425,8 +427,10 @@ export function createTaskFacade(deps) {
     },
 
     /**
-     * Every task on the install. The daemon is asked for `status` only.
-     * Project, agent, and type are applied here. Overrides and paths are dropped.
+     * Every task on the install. Release 0.1.8 is asked for `status` only:
+     * it has no limit, project, agent, type, or pagination. Those three filters
+     * are applied here, after the body is read. A body past the list ceiling
+     * is `too_large`, not an unreachable daemon. Overrides and paths are dropped.
      * @param {Record<string, unknown>} [opts]
      */
     async listAll(opts = {}) {
@@ -495,7 +499,8 @@ export function createTaskFacade(deps) {
     /**
      * Status change. `BLOCKED` requires a reason (`blocked_reason`).
      * `comment` is sent as `done_comment` in the same body: release 0.1.8
-     * stores that field when the status changes. Does not take a quota slot.
+     * stores that field only when the status value changes. A comment with
+     * no status change is not a call. Does not take a quota slot.
      * @param {unknown} taskId
      * @param {unknown} input
      */
@@ -503,20 +508,6 @@ export function createTaskFacade(deps) {
       const id = requireTaskId(taskId);
       const body = moveTaskBody(input);
       const result = await callTask(() => client.request('PUT', `/api/tasks/${id}`, body));
-      return taskFromResult(id, result, 200);
-    },
-
-    /**
-     * `done_comment`, the comment field `PUT /api/tasks/:id` accepts.
-     * Release 0.1.8 applies it when the same request also changes the status.
-     * A comment alone still sends nothing else. Does not take a quota slot.
-     * @param {unknown} taskId
-     * @param {unknown} text
-     */
-    async comment(taskId, text) {
-      const id = requireTaskId(taskId);
-      const comment = commentText(text);
-      const result = await callTask(() => client.request('PUT', `/api/tasks/${id}`, { done_comment: comment }));
       return taskFromResult(id, result, 200);
     },
   };
@@ -1288,6 +1279,7 @@ function asMissionTransport(err) {
  */
 function asTaskTransport(err) {
   if (err instanceof PluginTaskError || err instanceof PluginPolicyError) return err;
+  if (err instanceof DaemonBodyError) return new PluginTaskError('too_large', TASK_LIST_TOO_LARGE);
   if (err instanceof DaemonCallError) return new PluginTaskError('invalid', 'daemon is unreachable');
   if (err instanceof DaemonRouteError) return new PluginTaskError('invalid', 'daemon route is not allowed');
   return new PluginTaskError('invalid', clipped(err));

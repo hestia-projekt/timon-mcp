@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
-import { createDaemonClient } from '../../host/daemon.js';
+import { DaemonBodyError, DaemonCallError } from '../../host/errors.js';
+import {
+  RESPONSE_MAX_BYTES,
+  TASK_LIST_MAX_BYTES,
+  TASK_LIST_TOO_LARGE,
+  createDaemonClient,
+} from '../../host/daemon.js';
 import { openStack } from '../helpers/standalone.js';
 
 const FOREIGN = 'foreigntask01';
@@ -153,13 +159,6 @@ test('kanban tools talk to the fake daemon and drop overrides and paths', async 
     deps: [],
     agent_name: 'alpha.reviewer',
   });
-
-  const commented = await call(stack, 'comment_task', { task_id: createdId, comment: 'a note' });
-  assert.equal(commented.body.result.isError, false);
-  assert.equal(commented.body.result.structuredContent.done_comment, 'a note');
-  const commentCall = stack.daemon.requests.find((row) => row.bodyText === '{"done_comment":"a note"}');
-  assert.equal(commentCall.method, 'PUT');
-  assert.equal(commentCall.path, `/api/tasks/${createdId}`);
 
   const done = await call(stack, 'move_task', { task_id: FOREIGN, status: 'DONE', comment: 'shipped' });
   assert.equal(done.body.result.isError, false);
@@ -325,7 +324,6 @@ test('task routes, queries, encoded paths, and override fields never reach the d
     ['update_task', { task_id: FOREIGN, title: 'T', backend_override: 'other' }],
     ['update_task', { task_id: FOREIGN, model_override: 'other' }],
     ['move_task', { task_id: FOREIGN, status: 'DONE', permissionMode: 'auto' }],
-    ['comment_task', { task_id: FOREIGN, comment: 'hi', extra_skills: [] }],
     ['list_all_tasks', { status: 'running' }],
     ['list_all_tasks', { origin: 'user' }],
     ['get_task', { task_id: '../tasks' }],
@@ -368,7 +366,7 @@ test('task routes, queries, encoded paths, and override fields never reach the d
   assert.equal(stack.daemon.requests.at(-1).path, '/api/tasks/missing-task');
 });
 
-test('task creation shares the quota; list, read, update, move, and comment do not', async (t) => {
+test('task creation shares the quota; list, read, update, and move do not', async (t) => {
   const stack = await openStack(t, { foreignTaskId: FOREIGN, env: { TIMON_MCP_SPAWN_MAX: '1' } });
   const bad = await call(stack, 'add_task', {
     project: 'alpha', title: 'T', agent: 'alpha.coder', type: 'code', backend: 'other',
@@ -399,11 +397,132 @@ test('task creation shares the quota; list, read, update, move, and comment do n
   assert.equal(updated.body.result.isError, false);
   const moved = await call(stack, 'move_task', { task_id: createdId, status: 'BLOCKED', reason: 'stop' });
   assert.equal(moved.body.result.isError, false);
-  const commented = await call(stack, 'comment_task', { task_id: createdId, comment: 'note' });
-  assert.equal(commented.body.result.isError, false);
-  assert.equal(stack.daemon.requests.length, after + 5);
+  assert.equal(stack.daemon.requests.length, after + 4);
   assert.equal(stack.daemon.requests.filter((row) => row.method === 'POST' && row.path === '/api/tasks').length, 1);
 });
+
+test('a task list past 1 MiB is read, and past the list ceiling it is too_large', async (t) => {
+  const stack = await openStack(t, { foreignTaskId: FOREIGN });
+  const client = createDaemonClient({
+    origin: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    env: { [BEARER_SECRET]: stack.bearer },
+    bearerName: BEARER_SECRET,
+  });
+
+  const wide = taskPage(RESPONSE_MAX_BYTES + 4096);
+  assert.ok(Buffer.byteLength(JSON.stringify(wide)) > RESPONSE_MAX_BYTES);
+  assert.ok(Buffer.byteLength(JSON.stringify(wide)) < TASK_LIST_MAX_BYTES);
+  stack.daemon.setTaskList(wide);
+  const listed = await call(stack, 'list_all_tasks', { status: 'BLOCKED', project: 'beta' });
+  assert.equal(listed.body.result.isError, false);
+  assert.deepEqual(listed.body.result.structuredContent.tasks.map((row) => row.id), ['keep-me']);
+  assert.equal(listed.text.includes('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'), false);
+  assert.equal(stack.daemon.requests.at(-1).search, '?status=BLOCKED');
+
+  const over = taskPage(TASK_LIST_MAX_BYTES + 4096);
+  assert.ok(Buffer.byteLength(JSON.stringify(over)) > TASK_LIST_MAX_BYTES);
+  stack.daemon.setTaskList(over);
+  const huge = await call(stack, 'list_all_tasks', { project: 'beta', status: 'BLOCKED' });
+  assert.equal(huge.body.result.isError, true);
+  assert.equal(huge.body.result.content[0].text, TASK_LIST_TOO_LARGE);
+  assert.equal(huge.text.includes('daemon is unreachable'), false);
+  assert.equal(huge.text.includes('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'), false);
+
+  stack.daemon.failNext({
+    status: 200,
+    body: { task: { id: FOREIGN, description: 'y'.repeat(RESPONSE_MAX_BYTES + 128) } },
+  });
+  await assert.rejects(
+    () => client.request('GET', `/api/tasks/${FOREIGN}`),
+    (err) => err instanceof DaemonCallError && err.code === 'unreachable' && !(err instanceof DaemonBodyError),
+  );
+});
+
+test('done_comment is stored only when the status changes', async (t) => {
+  const stack = await openStack(t, { env: { TIMON_MCP_SPAWN_MAX: '5' } });
+  const client = createDaemonClient({
+    origin: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    env: { [BEARER_SECRET]: stack.bearer },
+    bearerName: BEARER_SECRET,
+  });
+  const created = await call(stack, 'add_task', {
+    project: 'alpha', title: 'Note', agent: 'alpha.coder', type: 'chore',
+  });
+  assert.equal(created.body.result.isError, false);
+  const id = created.body.result.structuredContent.id;
+  assert.equal(stack.daemon.tasks.get(id).done_comment, null);
+
+  const alone = await client.request('PUT', `/api/tasks/${id}`, { done_comment: 'silent' });
+  assert.equal(alone.status, 200);
+  assert.equal(stack.daemon.tasks.get(id).done_comment, null);
+  assert.equal(stack.daemon.tasks.get(id).status, 'PENDING');
+
+  const same = await client.request('PUT', `/api/tasks/${id}`, { status: 'PENDING', done_comment: 'silent' });
+  assert.equal(same.status, 200);
+  assert.equal(stack.daemon.tasks.get(id).done_comment, null);
+
+  const moved = await call(stack, 'move_task', { task_id: id, status: 'DONE', comment: 'shipped' });
+  assert.equal(moved.body.result.isError, false);
+  assert.equal(moved.body.result.structuredContent.done_comment, 'shipped');
+  assert.equal(stack.daemon.tasks.get(id).done_comment, 'shipped');
+
+  const cleared = await client.request('PUT', `/api/tasks/${id}`, { status: 'BLOCKED', blocked_reason: 'stop' });
+  assert.equal(cleared.status, 200);
+  assert.equal(stack.daemon.tasks.get(id).status, 'BLOCKED');
+  assert.equal(stack.daemon.tasks.get(id).blocked_reason, 'stop');
+  assert.equal(stack.daemon.tasks.get(id).done_comment, null);
+
+  const before = stack.daemon.requests.length;
+  const gone = await call(stack, 'comment_task', { task_id: id, comment: 'nope' });
+  assert.equal(gone.body.result.isError, true);
+  assert.equal(gone.body.result.content[0].text, 'unknown tool');
+  assert.equal(stack.daemon.requests.length, before);
+});
+
+/**
+ * A `{ tasks }` document of `bytes` UTF-8 bytes. Two rows, so a host-side
+ * project filter still has something to drop after the body is read.
+ * @param {number} bytes
+ */
+function taskPage(bytes) {
+  const tasks = [
+    {
+      id: 'keep-me',
+      title: 'Keep',
+      status: 'BLOCKED',
+      agent_name: 'beta.reviewer',
+      project: 'beta',
+      type: 'review',
+      priority: 1,
+      deps: '[]',
+      created_at: 1,
+      updated_at: 2,
+      description: '',
+    },
+    {
+      id: 'drop-me',
+      title: 'Drop',
+      status: 'BLOCKED',
+      agent_name: 'alpha.coder',
+      project: 'alpha',
+      type: 'code',
+      priority: 1,
+      deps: '[]',
+      created_at: 3,
+      updated_at: 4,
+      description: '',
+    },
+  ];
+  const bare = Buffer.byteLength(JSON.stringify({ tasks, view: 'board' }));
+  const pad = bytes - bare;
+  assert.ok(pad > 0);
+  tasks[1].description = 'x'.repeat(pad);
+  const body = { tasks, view: 'board' };
+  assert.equal(Buffer.byteLength(JSON.stringify(body)), bytes);
+  return body;
+}
 
 /**
  * @param {Awaited<ReturnType<typeof openStack>>} stack
