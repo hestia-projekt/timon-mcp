@@ -73,8 +73,11 @@ export class DaemonCallError extends Error {
  * The message is fixed and carries no secret. The bytes are not parsed.
  */
 export class DaemonBodyError extends Error {
-  constructor() {
-    super('daemon response is too large');
+  /**
+   * @param {string} [message]
+   */
+  constructor(message = 'daemon response is too large') {
+    super(message);
     this.name = 'DaemonBodyError';
     this.code = 'too_large';
   }

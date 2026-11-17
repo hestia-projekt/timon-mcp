@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
 import { DaemonBodyError, DaemonCallError, DaemonRouteError } from './errors.js';
 import {
+  AUTOMATION_ID,
   DIRECT_FROM_AGENT,
   DIRECT_FROM_MISSION,
   EVENT_ID,
@@ -22,6 +23,7 @@ import {
   PROJECT_NAME,
   RESERVED_AGENT_WORDS,
   RESERVED_MISSION_IDS,
+  RESERVED_WORKFLOW_IDS,
   TASK_STATUS,
   isWorkReturnPayload,
 } from './names.js';
@@ -41,9 +43,32 @@ export const TASK_LIST_MAX_BYTES = 8 * 1024 * 1024;
 /** Tool-facing text when `GET /api/tasks` crosses `TASK_LIST_MAX_BYTES`. */
 export const TASK_LIST_TOO_LARGE = `too_large: GET /api/tasks exceeded ${TASK_LIST_MAX_BYTES / (1024 * 1024)} MiB. Release 0.1.8 has no limit, project, agent, type, or pagination. Pass status, or read one task with get_task.`;
 
+/**
+ * Pipelines, workflows, and routines have no limit or pagination on release
+ * 0.1.8. A workflow list carries every draft, and a run list carries every
+ * `context`. Same ceiling as `GET /api/tasks`.
+ */
+export const AUTOMATION_READ_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Serialised size of a run's `input`. Same cap as `MAX_PIPELINE_INPUT_BYTES`
+ * and `MAX_WORKFLOW_INPUT_BYTES` in release 0.1.8.
+ */
+export const RUN_INPUT_MAX_BYTES = 64 * 1024;
+
+/**
+ * @param {string} method
+ * @param {string} path
+ */
+export function automationTooLarge(method, path) {
+  const mib = AUTOMATION_READ_MAX_BYTES / (1024 * 1024);
+  return `too_large: ${method} ${path} exceeded ${mib} MiB. Release 0.1.8 has no limit or pagination on this route. Pass limit, or read one item.`;
+}
+
 const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
 const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
 const AGENT_SEGMENT = NAMED_AGENT.source.slice(1, -1);
+const AUTO_SEGMENT = AUTOMATION_ID.source.slice(1, -1);
 
 /**
  * Couples the host is allowed to call. `:id` is one mission id.
@@ -166,6 +191,69 @@ export const DAEMON_ROUTES = Object.freeze([
     // by `assertDirectMessage`. A caller-supplied value is refused here.
     body: Object.freeze(['to_agent', 'payload', 'kind', 'from_mission', 'from_agent']),
   }),
+  Object.freeze({
+    name: 'pipelines.list',
+    method: 'GET',
+    path: '/api/pipelines',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'pipelines.get',
+    method: 'GET',
+    path: '/api/pipelines/:auto',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    // Longer than `:auto`, so `runs` is this route and not a pipeline id.
+    name: 'pipelines.runStatus',
+    method: 'GET',
+    path: '/api/pipelines/runs/:auto',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'pipelines.run',
+    method: 'POST',
+    path: '/api/pipelines/:auto/run',
+    // Exactly `{ input }`. `draft`, backend, model, and permission are not keys.
+    body: Object.freeze(['input']),
+  }),
+  Object.freeze({
+    name: 'workflows.list',
+    method: 'GET',
+    path: '/api/workflows',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'workflows.get',
+    method: 'GET',
+    path: '/api/workflows/:auto',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'workflows.runs',
+    method: 'GET',
+    path: '/api/workflows/:auto/runs',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'workflows.run',
+    method: 'POST',
+    path: '/api/workflows/:auto/run',
+    // Exactly `{ input }`. `draft` would run the unpublished graph and is refused.
+    body: Object.freeze(['input']),
+  }),
+  Object.freeze({
+    name: 'routines.list',
+    method: 'GET',
+    path: '/api/routines',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    name: 'routines.get',
+    method: 'GET',
+    path: '/api/routines/:auto',
+    maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
 /**
@@ -176,6 +264,7 @@ function compileRoute(path) {
     if (segment === ':id') return ID_SEGMENT;
     if (segment === ':eventId') return EVENT_SEGMENT;
     if (segment === ':name') return AGENT_SEGMENT;
+    if (segment === ':auto') return AUTO_SEGMENT;
     if (segment.startsWith(':') && segment.length > 1) return '[^/]+';
     return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }).join('/');
@@ -220,7 +309,7 @@ export function matchDaemonRoute(method, path) {
     return null;
   }
   if (decoded !== path) return null;
-  if (reservedMissionPath(path) || reservedAgentPath(path)) return null;
+  if (reservedMissionPath(path) || reservedAgentPath(path) || reservedWorkflowPath(path)) return null;
   const upper = method.toUpperCase();
   return DAEMON_ROUTES.find((route) => route.method === upper && route.re.test(path)) ?? null;
 }
@@ -246,6 +335,19 @@ function reservedAgentPath(path) {
   const parts = path.split('/');
   if (parts[1] !== 'api' || parts[2] !== 'agents' || parts.length !== 4) return false;
   return RESERVED_AGENT_WORDS.has(parts[3]);
+}
+
+/**
+ * `GET /api/workflows/runs`, `GET /api/workflows/runs/:runId`,
+ * `GET /api/workflows/node-types`, and `POST /api/workflows/import/…` are
+ * real daemon routes. `:auto` must not carry those words. `hooks` is the
+ * retired token URL and is refused the same way.
+ * @param {string} path
+ */
+function reservedWorkflowPath(path) {
+  const parts = path.split('/');
+  if (parts[1] !== 'api' || parts[2] !== 'workflows') return false;
+  return RESERVED_WORKFLOW_IDS.has(parts[3]);
 }
 
 /**
@@ -344,12 +446,8 @@ export function createDaemonClient(options) {
       }
       let text = '';
       try {
-        const listing = route.name === 'tasks.list';
-        text = await readCappedText(
-          response,
-          listing ? TASK_LIST_MAX_BYTES : RESPONSE_MAX_BYTES,
-          listing ? new DaemonBodyError() : new DaemonCallError(),
-        );
+        const cap = readCap(route);
+        text = await readCappedText(response, cap.bytes, cap.overflow);
       } catch (err) {
         if (err instanceof DaemonCallError || err instanceof DaemonBodyError) throw err;
         throw new DaemonCallError();
@@ -446,6 +544,66 @@ function assertBody(route, method, path, body) {
     if (!allowed.has(key)) throw new DaemonRouteError(method, path);
   }
   if (route.name === 'messages.send') assertDirectMessage(method, path, body);
+  if (route.name === 'pipelines.run' || route.name === 'workflows.run') {
+    assertRunInput(method, path, body);
+  }
+}
+
+/**
+ * The run body is exactly `{ input }`, and `input` is a JSON object of at
+ * most `RUN_INPUT_MAX_BYTES`. An array, a string, or a larger object is refused.
+ * @param {string} method
+ * @param {string} path
+ * @param {Record<string, unknown>} body
+ */
+const RUN_OVERRIDE = new Set([
+  'model',
+  'backend',
+  'extraSkills',
+  'extraMcp',
+  'allow',
+  'model_override',
+  'backend_override',
+  'extra_skills',
+  'extra_mcp_servers',
+  'extra_allowed_tools',
+  'permission_mode',
+  'permissionMode',
+  'draft',
+]);
+
+function assertRunInput(method, path, body) {
+  if (!isPlain(body.input)) throw new DaemonRouteError(method, path);
+  for (const key of Object.keys(body.input)) {
+    const lower = key.toLowerCase();
+    if (RUN_OVERRIDE.has(key) || key.includes('override') || key.includes('Override') || lower.includes('fallback')) {
+      throw new DaemonRouteError(method, path);
+    }
+  }
+  let size;
+  try {
+    size = Buffer.byteLength(JSON.stringify(body.input));
+  } catch {
+    throw new DaemonRouteError(method, path);
+  }
+  if (size > RUN_INPUT_MAX_BYTES) throw new DaemonRouteError(method, path);
+}
+
+/**
+ * @param {{ name?: string, method?: string, path?: string, maxBytes?: number }} route
+ * @returns {{ bytes: number, overflow: Error }}
+ */
+function readCap(route) {
+  if (route.name === 'tasks.list') {
+    return { bytes: TASK_LIST_MAX_BYTES, overflow: new DaemonBodyError() };
+  }
+  if (typeof route.maxBytes === 'number') {
+    return {
+      bytes: route.maxBytes,
+      overflow: new DaemonBodyError(automationTooLarge(route.method, route.path)),
+    };
+  }
+  return { bytes: RESPONSE_MAX_BYTES, overflow: new DaemonCallError() };
 }
 
 /**

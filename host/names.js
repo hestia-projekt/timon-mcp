@@ -51,6 +51,22 @@ export const RESERVED_MISSION_IDS = new Set(['latest', 'search', 'delegate']);
 export const RESERVED_AGENT_WORDS = new Set(['active', 'spawn', 'ephemeral', 'main']);
 
 /**
+ * An id this host will place under `/api/pipelines`, `/api/workflows`, or
+ * `/api/routines`. A workflow slug may contain dots (`feature.flow`). `..` is
+ * still a path, and a leading dot is not an id.
+ */
+export const AUTOMATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
+/**
+ * First segments the daemon serves under `/api/workflows/<word>` as their own
+ * routes. `runs` is `GET /api/workflows/runs` and `GET /api/workflows/runs/:runId`
+ * (the run detail, which carries the definition). `node-types` and `import`
+ * are their own routes. `hooks` is the retired token URL. None of them is a
+ * workflow id.
+ */
+export const RESERVED_WORKFLOW_IDS = new Set(['runs', 'node-types', 'import', 'hooks']);
+
+/**
  * `from_mission` the host sends on `POST /api/messages`.
  * Release 0.1.8 `dist/notify.js` `SYSTEM_MISSION_ID`. The caller does not choose it.
  */
@@ -126,6 +142,22 @@ export function isTaskStatus(value) {
  */
 export function isTaskType(value) {
   return typeof value === 'string' && TASK_TYPE.test(value);
+}
+
+/**
+ * @param {unknown} value
+ */
+export function isAutomationId(value) {
+  return typeof value === 'string' && AUTOMATION_ID.test(value) && !value.includes('..');
+}
+
+/**
+ * A workflow id or slug. Reserved route words are refused: `runs` would hit
+ * `GET /api/workflows/runs`, which is not in the closed list.
+ * @param {unknown} value
+ */
+export function isWorkflowId(value) {
+  return isAutomationId(value) && !RESERVED_WORKFLOW_IDS.has(value);
 }
 
 /**

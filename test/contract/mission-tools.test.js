@@ -22,9 +22,19 @@ const ROUTES = [
   'GET /api/agents',
   'GET /api/agents/:name',
   'POST /api/messages',
+  'GET /api/pipelines',
+  'GET /api/pipelines/:auto',
+  'GET /api/pipelines/runs/:auto',
+  'POST /api/pipelines/:auto/run',
+  'GET /api/workflows',
+  'GET /api/workflows/:auto',
+  'GET /api/workflows/:auto/runs',
+  'POST /api/workflows/:auto/run',
+  'GET /api/routines',
+  'GET /api/routines/:auto',
 ];
 
-test('the closed list is the seventeen mission, task, project, and agent routes', () => {
+test('the closed list is the twenty-seven mission, task, project, agent, and automation routes', () => {
   assert.deepEqual(
     DAEMON_ROUTES.map((route) => `${route.method} ${route.path}`),
     ROUTES,
