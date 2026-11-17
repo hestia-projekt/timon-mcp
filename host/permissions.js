@@ -7,10 +7,13 @@
  *
  * A renderable `ask_user` card is a question or a kanban plan. The fields are
  * the whitelist of `projectQuestion` (`questions-facade.js`). Anything else is
- * a tool approval: tool name, mission, agent, dates, and a bounded redacted
- * view of the input. `questionKindOf` is the same split as the release
- * (`permissions.js`): `ask_user` whose payload does not validate is not a
- * question.
+ * a tool approval. `projectCard` is the webhook projection: type, id, tool,
+ * mission, agent, and dates, plus that whitelist for a question. It carries
+ * no tool input. `projectListedCard` is the authenticated `list_pending`
+ * view of the same card. An approval there adds a bounded redacted preview
+ * of `input.command` and nothing else from the input.
+ * `questionKindOf` is the same split as the release (`permissions.js`):
+ * `ask_user` whose payload does not validate is not a question.
  */
 import { isDisplayAgent, isMissionId } from './names.js';
 
@@ -27,18 +30,13 @@ const MAX_GROUP_NAME_CHARS = 60;
 const MAX_GROUPS = 6;
 const GROUP_NAME_CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
-const ENTRY_STRING_MAX = 160;
-const ENTRY_KEYS_MAX = 20;
-const ENTRY_ARRAY_MAX = 8;
-const ENTRY_DEPTH_MAX = 4;
-const ENTRY_BYTES_MAX = 2048;
+/** Characters kept from a tool command on the authenticated list. */
+const COMMAND_PREVIEW_MAX = 160;
 
 const CARD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
-const SENSITIVE_KEY = /secret|password|passwd|token|authorization|api[-_]?key|credential|cookie|bearer|private[-_]?key/i;
 const BEARER_VALUE = /Bearer\s+\S+/gi;
 const LONG_HEX = /[0-9a-fA-F]{32,}/g;
-const SKIP_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 /**
  * @param {unknown} value
@@ -163,59 +161,24 @@ export function questionKindOf(card) {
 }
 
 /**
- * @param {unknown} value
+ * Bearer tokens and long hex runs, then the preview cap.
+ * @param {string} value
  * @returns {string}
  */
 function redactString(value) {
   const cleaned = value.replace(BEARER_VALUE, 'Bearer [redacted]').replace(LONG_HEX, '[redacted]');
-  return cleaned.length > ENTRY_STRING_MAX ? cleaned.slice(0, ENTRY_STRING_MAX) : cleaned;
+  return cleaned.length > COMMAND_PREVIEW_MAX ? cleaned.slice(0, COMMAND_PREVIEW_MAX) : cleaned;
 }
 
 /**
- * @param {unknown} value
- * @param {number} depth
- * @returns {unknown}
- */
-function boundValue(value, depth) {
-  if (typeof value === 'string') return redactString(value);
-  if (typeof value === 'boolean' || value === null) return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (depth >= ENTRY_DEPTH_MAX) return null;
-  if (Array.isArray(value)) {
-    return value.slice(0, ENTRY_ARRAY_MAX).map((item) => boundValue(item, depth + 1));
-  }
-  if (!isPlain(value)) return null;
-  /** @type {Record<string, unknown>} */
-  const out = {};
-  const keys = Object.keys(value).filter((key) => !SKIP_KEYS.has(key)).slice(0, ENTRY_KEYS_MAX);
-  for (const key of keys) {
-    if (SENSITIVE_KEY.test(key)) {
-      out[key] = '[redacted]';
-      continue;
-    }
-    out[key] = boundValue(value[key], depth + 1);
-  }
-  return out;
-}
-
-/**
- * Bounded, redacted view of a tool input. Never the raw object.
- * A value that is still too big becomes `{ truncated: true }`.
+ * Preview of a tool command for `list_pending`. `null` when `input.command`
+ * is not a string. No other input field is read.
  * @param {unknown} input
- * @returns {Record<string, unknown>}
+ * @returns {string | null}
  */
-export function boundEntry(input) {
-  if (!isPlain(input)) return {};
-  const bounded = boundValue(input, 0);
-  if (!isPlain(bounded)) return {};
-  let text;
-  try {
-    text = JSON.stringify(bounded);
-  } catch {
-    return { truncated: true };
-  }
-  if (Buffer.byteLength(text) > ENTRY_BYTES_MAX) return { truncated: true };
-  return bounded;
+export function commandPreview(input) {
+  if (!isPlain(input) || typeof input.command !== 'string') return null;
+  return redactString(input.command);
 }
 
 /**
@@ -263,7 +226,8 @@ function timestamp(value) {
 /**
  * One card, or `null` when the id, mission, or agent cannot be shown.
  * The agent is a display name (`isDisplayAgent`), not a path name.
- * The returned object is built field by field. Raw input is not copied.
+ * The returned object is built field by field. An approval has no tool input:
+ * that shape is what a webhook may carry.
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
  */
@@ -310,6 +274,17 @@ export function projectCard(raw) {
     type: 'approval',
     ...base,
     tool_name: toolName,
-    entry: boundEntry(raw.input),
   };
+}
+
+/**
+ * Authenticated list. Same card as `projectCard`, and for an approval the
+ * command preview only. `shell_command` and `script_previews` are not read.
+ * @param {unknown} raw
+ * @returns {Record<string, unknown> | null}
+ */
+export function projectListedCard(raw) {
+  const card = projectCard(raw);
+  if (!card || card.type !== 'approval') return card;
+  return { ...card, command: commandPreview(isPlain(raw) ? raw.input : null) };
 }

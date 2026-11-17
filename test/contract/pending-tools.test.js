@@ -9,7 +9,12 @@ import { test } from 'node:test';
 import { BEARER_SECRET } from '../../lib/constants.js';
 import { PERMISSIONS_TOO_LARGE, RESPONSE_MAX_BYTES, createDaemonClient } from '../../host/daemon.js';
 import { PENDING_CARD_CAP } from '../../host/permissions.js';
-import { RESOLVED_ROW_CAP, createPendingWatcher } from '../../host/pending.js';
+import {
+  DELIVERY_CONCURRENCY,
+  DELIVERY_QUEUE_CAP,
+  RESOLVED_ROW_CAP,
+  createPendingWatcher,
+} from '../../host/pending.js';
 import { startStandalone } from '../../host/standalone.js';
 import {
   WEBHOOK_ATTEMPTS,
@@ -148,7 +153,7 @@ test('list_pending projects questions, plans and approvals and drops the raw car
     tool_name: 'bash',
     tool_use_id: secret,
     input: {
-      command: `echo ${secret}`,
+      command: `echo ${secret} ${'z'.repeat(200)}`,
       token: secret,
       note: 'VISIBLE',
       timeout: 5,
@@ -209,21 +214,25 @@ test('list_pending projects questions, plans and approvals and drops the raw car
   assert.equal(cards[2].tool_name, 'bash');
   assert.equal(cards[2].mission_id, 'othermission01');
   assert.equal(cards[2].expires_at, 4000);
-  assert.equal(cards[2].entry.token, '[redacted]');
-  assert.equal(cards[2].entry.note, 'VISIBLE');
-  assert.equal(cards[2].entry.timeout, 5);
-  assert.equal(cards[2].entry.nested.authorization, '[redacted]');
-  assert.equal(cards[2].entry.nested.ok, 'kept');
-  assert.equal(cards[2].entry.command.includes(secret), false);
+  assert.equal(Object.hasOwn(cards[2], 'entry'), false);
+  assert.equal(cards[2].command.length, 160);
+  assert.equal(cards[2].command.startsWith('echo [redacted] '), true);
+  assert.equal(cards[2].command.includes(secret), false);
+  assert.equal(JSON.stringify(cards[2]).includes('VISIBLE'), false);
+  assert.equal(JSON.stringify(cards[2]).includes('token'), false);
   assert.equal(cards[3].type, 'approval');
   assert.equal(cards[3].tool_name, 'ask_user');
-  assert.equal(cards[3].entry.token, '[redacted]');
+  assert.equal(cards[3].command, null);
+  assert.equal(JSON.stringify(cards[3]).includes(secret), false);
   for (const card of cards) {
     assert.equal(Object.hasOwn(card, 'input'), false);
+    assert.equal(Object.hasOwn(card, 'entry'), false);
     assert.equal(Object.hasOwn(card, 'shell_command'), false);
     assert.equal(Object.hasOwn(card, 'tool_use_id'), false);
     assert.equal(Object.hasOwn(card, 'script_previews'), false);
     assert.equal(Object.hasOwn(card, 'onPaste'), false);
+    if (card.type === 'approval') assert.equal(Object.hasOwn(card, 'command'), true);
+    else assert.equal(Object.hasOwn(card, 'command'), false);
   }
   assert.equal(listed.text.includes(secret), false);
   assert.equal(listed.text.includes('Bearer'), false);
@@ -312,6 +321,9 @@ test('without a webhook URL the poller records cards and sends nothing', async (
   assert.equal(typeof stored.projection, 'string');
   assert.equal(stored.projection.includes(secret), false);
   assert.equal(stored.projection.includes('input'), false);
+  assert.equal(stored.projection.includes('"entry"'), false);
+  assert.equal(stored.projection.includes('"command"'), false);
+  assert.equal(stored.projection.includes('VISIBLE'), false);
   assert.equal(JSON.stringify(stack.logs).includes(secret), false);
 });
 
@@ -340,6 +352,7 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
 
   await stack.host.pollPending();
+  await stack.host.settlePending();
   assert.deepEqual(delays, [200]);
   assert.equal(receiver.requests.length, 2);
   const delivered = receiver.requests[1];
@@ -347,14 +360,26 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   assert.equal(delivered.body.includes(cardSecret), false);
   assert.equal(delivered.body.includes(hookSecret), false);
   assert.equal(delivered.body.includes('"input"'), false);
+  assert.equal(delivered.body.includes('"entry"'), false);
+  assert.equal(delivered.body.includes('"command"'), false);
+  assert.equal(delivered.body.includes('shell_command'), false);
+  assert.equal(delivered.body.includes('script_previews'), false);
+  assert.equal(delivered.body.includes('VISIBLE'), false);
   const payload = JSON.parse(delivered.body);
   assert.equal(payload.event, 'pending');
-  assert.equal(payload.card.id, APPROVAL_ID);
-  assert.equal(payload.card.type, 'approval');
-  assert.equal(payload.card.entry.token, '[redacted]');
+  assert.deepEqual(payload.card, {
+    type: 'approval',
+    id: APPROVAL_ID,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: 3000,
+    expires_at: 4000,
+    tool_name: 'bash',
+  });
   verifySignature(delivered, hookSecret);
 
   await stack.host.pollPending();
+  await stack.host.settlePending();
   assert.equal(receiver.requests.length, 2);
 
   await stack.host.close();
@@ -371,10 +396,12 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   });
   t.after(() => again.close());
   await again.pollPending();
+  await again.settlePending();
   assert.equal(receiver.requests.length, 2, 'a restart must not send the same pending card');
 
   stack.daemon.permissions.delete(APPROVAL_ID);
   await again.pollPending();
+  await again.settlePending();
   assert.equal(receiver.requests.length, 3);
   const resolved = receiver.requests[2];
   const resolvedBody = JSON.parse(resolved.body);
@@ -406,6 +433,7 @@ test('a refused webhook is abandoned after three tries and a redirect is not fol
   });
   stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
   await stack.host.pollPending();
+  await stack.host.settlePending();
   assert.deepEqual(delays, [200, 800]);
   assert.equal(receiver.requests.length, WEBHOOK_ATTEMPTS);
   assert.deepEqual(receiver.requests.map((row) => row.url), ['/hook', '/hook', '/hook']);
@@ -417,6 +445,7 @@ test('a refused webhook is abandoned after three tries and a redirect is not fol
   assert.equal(logged.includes('/followed'), false);
 
   await stack.host.pollPending();
+  await stack.host.settlePending();
   assert.equal(receiver.requests.length, WEBHOOK_ATTEMPTS, 'an abandoned event is not tried again');
 });
 
@@ -499,20 +528,32 @@ test('an ephemeral agent is listed and notified, and a bad card is dropped by id
   assert.deepEqual(cards.map((card) => card.id), [EPH_ID]);
   assert.equal(cards[0].agent, '_eph-1a2b3c4d');
   assert.equal(cards[0].type, 'approval');
+  assert.equal(cards[0].command, 'echo [redacted]');
+  assert.equal(Object.hasOwn(cards[0], 'entry'), false);
   assert.equal(listed.text.includes(secret), false);
   assert.equal(listed.text.includes('bad agent'), false);
   assert.equal(listed.text.includes(BAD_ID), false);
 
   await stack.host.pollPending();
+  await stack.host.settlePending();
   assert.equal(receiver.requests.length, 1);
   const delivered = receiver.requests[0];
   const payload = JSON.parse(delivered.body);
   assert.equal(payload.event, 'pending');
-  assert.equal(payload.card.id, EPH_ID);
-  assert.equal(payload.card.agent, '_eph-1a2b3c4d');
+  assert.deepEqual(payload.card, {
+    type: 'approval',
+    id: EPH_ID,
+    mission_id: 'foreignmission01',
+    agent: '_eph-1a2b3c4d',
+    created_at: 1000,
+    expires_at: 2000,
+    tool_name: 'bash',
+  });
   assert.equal(delivered.body.includes(secret), false);
   assert.equal(delivered.body.includes(hookSecret), false);
   assert.equal(delivered.body.includes('"input"'), false);
+  assert.equal(delivered.body.includes('"command"'), false);
+  assert.equal(delivered.body.includes('"entry"'), false);
   assert.equal(delivered.body.includes('bad agent'), false);
   assert.equal(delivered.body.includes(BAD_ID), false);
   verifySignature(delivered, hookSecret);
@@ -590,6 +631,160 @@ test('the poller fires on the configured interval', async (t) => {
     if (Date.now() - started > 4000) assert.fail('poller did not fire');
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+});
+
+test('a question webhook keeps the question projection and no tool input', async (t) => {
+  const secret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  const receiver = await startReceiver(() => ({ status: 204 }));
+  t.after(() => receiver.close());
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+  stack.daemon.permissions.set(QUESTION_ID, {
+    id: QUESTION_ID,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    tool_name: 'ask_user',
+    input: {
+      message: secret,
+      questions: [{ question: 'Ship it?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+      secret,
+    },
+    shell_command: secret,
+    script_previews: [secret],
+    created_at: 1000,
+    timeout_ms: 1000,
+  });
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 1);
+  const body = receiver.requests[0].body;
+  const payload = JSON.parse(body);
+  assert.equal(payload.event, 'pending');
+  assert.equal(payload.card.type, 'question');
+  assert.equal(payload.card.questions[0].question, 'Ship it?');
+  assert.equal(payload.card.plan, null);
+  assert.equal(Object.hasOwn(payload.card, 'command'), false);
+  assert.equal(Object.hasOwn(payload.card, 'entry'), false);
+  assert.equal(Object.hasOwn(payload.card, 'input'), false);
+  assert.equal(body.includes(secret), false);
+  assert.equal(body.includes('shell_command'), false);
+  assert.equal(body.includes('script_previews'), false);
+  verifySignature(receiver.requests[0], hookSecret);
+});
+
+test('a card the daemon still lists is not resolved when the projection rejects it', async (t) => {
+  const secret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  const receiver = await startReceiver(() => ({ status: 204 }));
+  t.after(() => receiver.close());
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(secret));
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 1);
+
+  stack.daemon.permissions.set(APPROVAL_ID, {
+    ...approvalCard(secret),
+    agent: 'bad agent',
+    input: { command: secret, token: secret },
+    shell_command: secret,
+    script_previews: [secret],
+  });
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 1);
+  const row = stack.host.ctx.sql.prepare('SELECT event FROM host_pending_cards WHERE id = ?').get(APPROVAL_ID);
+  assert.equal(row.event, 'pending');
+  const dropped = stack.logs
+    .map((entry) => entry.message)
+    .filter((message) => message.startsWith('pending card dropped'));
+  assert.ok(dropped.includes(`pending card dropped id=${APPROVAL_ID}`));
+  for (const message of dropped) assert.equal(message.includes(secret), false);
+  assert.equal(JSON.stringify(stack.logs).includes(secret), false);
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 2);
+  assert.equal(JSON.parse(receiver.requests[1].body).event, 'resolved');
+  assert.equal(receiver.requests[1].body.includes(secret), false);
+  assert.equal(receiver.requests[1].body.includes('"command"'), false);
+});
+
+test('a poll does not wait for a silent receiver, and the delivery queue is capped', async (t) => {
+  const secret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = resolve; });
+  const receiver = await startReceiver(async () => {
+    await gate;
+    return { status: 204 };
+  });
+  t.after(() => {
+    release();
+    return receiver.close();
+  });
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+  const total = DELIVERY_QUEUE_CAP + 3;
+  for (let i = 0; i < total; i += 1) {
+    const id = `55555555-5555-4555-8555-${String(i).padStart(12, '0')}`;
+    stack.daemon.permissions.set(id, {
+      ...approvalCard(secret),
+      id,
+      created_at: i,
+      shell_command: secret,
+      script_previews: [secret],
+    });
+  }
+
+  await within(1000, stack.host.pollPending(), 'poll waited for the silent receiver');
+  await waitUntil(() => receiver.requests.length >= DELIVERY_CONCURRENCY, 1000);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(receiver.requests.length, DELIVERY_CONCURRENCY);
+
+  await within(1000, stack.host.pollPending(), 'a later poll waited for the silent receiver');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(receiver.requests.length, DELIVERY_CONCURRENCY);
+  assert.match(JSON.stringify(stack.logs), /pending delivery queue is full/);
+  assert.equal(JSON.stringify(stack.logs).includes(secret), false);
+  assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
+
+  release();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, DELIVERY_QUEUE_CAP);
+  for (const request of receiver.requests) {
+    assert.equal(request.body.includes(secret), false);
+    assert.equal(request.body.includes('"command"'), false);
+    assert.equal(request.body.includes('"entry"'), false);
+    assert.equal(request.body.includes('shell_command'), false);
+    assert.equal(request.body.includes('script_previews'), false);
+  }
+  const stored = stack.host.ctx.sql.prepare("SELECT COUNT(*) AS n FROM host_pending_cards WHERE event = 'pending'").get();
+  assert.equal(Number(stored.n), DELIVERY_QUEUE_CAP);
+
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, total);
+  const all = stack.host.ctx.sql.prepare("SELECT COUNT(*) AS n FROM host_pending_cards WHERE event = 'pending'").get();
+  assert.equal(Number(all.n), total);
 });
 
 /**
@@ -671,6 +866,8 @@ async function call(stack, name, args) {
 async function startReceiver(handler) {
   /** @type {Array<{ url: string, body: string, headers: import('node:http').IncomingHttpHeaders }>} */
   const requests = [];
+  /** @type {Set<import('node:net').Socket>} */
+  const sockets = new Set();
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -680,9 +877,18 @@ async function startReceiver(handler) {
       headers: req.headers,
     };
     requests.push(record);
-    const outcome = handler(record);
-    res.writeHead(outcome.status, outcome.headers || {});
-    res.end(outcome.body || '');
+    try {
+      const outcome = await handler(record);
+      if (res.destroyed || res.writableEnded) return;
+      res.writeHead(outcome.status, outcome.headers || {});
+      res.end(outcome.body || '');
+    } catch {
+      if (!res.destroyed) res.destroy();
+    }
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -694,9 +900,41 @@ async function startReceiver(handler) {
     url: `http://127.0.0.1:${bound.port}/hook`,
     requests,
     close() {
+      for (const socket of sockets) socket.destroy();
       return new Promise((resolve) => {
         server.close(() => resolve());
       });
     },
   };
+}
+
+/**
+ * @param {number} ms
+ * @param {Promise<unknown>} work
+ * @param {string} label
+ */
+async function within(ms, work, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * @param {() => boolean} predicate
+ * @param {number} timeoutMs
+ */
+async function waitUntil(predicate, timeoutMs) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) assert.fail('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }

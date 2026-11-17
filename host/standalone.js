@@ -297,6 +297,7 @@ export async function startStandalone(options = {}) {
     journal,
     pendingIntervalMs,
     pollPending() { return pending.poll(); },
+    settlePending() { return pending.idle(); },
     bodyBytesRetained() { return retained.bytes; },
     socketTimeoutMs: server.timeout,
   };

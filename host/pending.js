@@ -9,9 +9,13 @@
  * recorded does not. `list_pending` reads the daemon on demand and does not
  * use that table.
  *
- * A timer tick that arrives while a pass is running is ignored. Resolved
- * rows are kept up to `RESOLVED_ROW_CAP`; the oldest are deleted past that.
- * A card `projectCard` refuses is logged by id only, never by its body.
+ * A timer tick that arrives while a pass is running is ignored. The pass
+ * reads, diffs, and enqueues. It does not wait for a webhook try. At most
+ * `DELIVERY_CONCURRENCY` deliveries run at once, and at most
+ * `DELIVERY_QUEUE_CAP` are outstanding. Resolved rows are kept up to
+ * `RESOLVED_ROW_CAP`; the oldest are deleted past that.
+ * A card `projectCard` refuses stays seen for that pass. The host logs the
+ * id only. `resolved` is emitted only when the id is absent from the list.
  */
 import { PERMISSIONS_TOO_LARGE } from './daemon.js';
 import {
@@ -21,7 +25,7 @@ import {
   PluginMissionError,
 } from './errors.js';
 import { isMissionId } from './names.js';
-import { PENDING_CARD_CAP, projectCard } from './permissions.js';
+import { PENDING_CARD_CAP, projectCard, projectListedCard } from './permissions.js';
 import { deliverWebhook } from './webhook.js';
 
 const DEFAULT_LIMIT = 50;
@@ -29,6 +33,15 @@ const MAX_LIMIT = 100;
 
 /** Resolved rows kept after a complete poll. Oldest go first past this. */
 export const RESOLVED_ROW_CAP = 200;
+
+/** Webhook deliveries running at the same time. */
+export const DELIVERY_CONCURRENCY = 4;
+
+/**
+ * Outstanding deliveries, waiting and in flight together.
+ * A pass that reaches this leaves the rest unrecorded for a later pass.
+ */
+export const DELIVERY_QUEUE_CAP = 32;
 
 /** A dropped id is logged alone, and not as a whole card. */
 const DROPPED_ID_MAX = 200;
@@ -124,10 +137,18 @@ export function createPendingWatcher(options) {
   let chain = Promise.resolve();
   let stopped = false;
   let busy = false;
+  /** @type {Array<{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string }>} */
+  const queue = [];
+  /** Keys of jobs that are queued or in flight. */
+  const inflight = new Set();
+  let active = 0;
+  let outstanding = 0;
+  let deliveryIdle = Promise.resolve();
+  let markDeliveryIdle = () => {};
 
   /**
    * `projectCard` refused this value. The id is logged when it is a string.
-   * The card body is not.
+   * The card body is not. The caller still keeps the raw id as seen.
    * @param {unknown} raw
    */
   function noteDropped(raw) {
@@ -139,8 +160,74 @@ export function createPendingWatcher(options) {
     log(`pending card dropped id=${id}`);
   }
 
+  function noteQueued() {
+    if (outstanding === 0) {
+      deliveryIdle = new Promise((resolve) => {
+        markDeliveryIdle = resolve;
+      });
+    }
+    outstanding += 1;
+  }
+
+  function noteFinished() {
+    outstanding -= 1;
+    if (outstanding === 0) markDeliveryIdle();
+  }
+
   /**
-   * @returns {Promise<Record<string, unknown>[] | null>}
+   * @param {'pending' | 'resolved'} event
+   * @param {Record<string, unknown>} card
+   * @returns {boolean} `false` when the global ceiling refused the job.
+   */
+  function acceptDelivery(event, card) {
+    const id = String(card.id);
+    const key = `${event}:${id}`;
+    if (inflight.has(key)) return true;
+    if (outstanding >= DELIVERY_QUEUE_CAP) return false;
+    inflight.add(key);
+    noteQueued();
+    queue.push({ event, card, id, key });
+    pump();
+    return true;
+  }
+
+  function pump() {
+    while (!stopped && active < DELIVERY_CONCURRENCY && queue.length > 0) {
+      const job = queue.shift();
+      if (!job) break;
+      active += 1;
+      void runDelivery(job);
+    }
+  }
+
+  /**
+   * @param {{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string }} job
+   */
+  async function runDelivery(job) {
+    try {
+      if (!stopped) await emit(job.event, job.card);
+    } catch {
+      /* deliverWebhook already bounds its own failures */
+    } finally {
+      active -= 1;
+    }
+    if (!stopped) {
+      try {
+        store.save(job.id, job.event, job.card, now());
+        if (job.event === 'resolved') store.purgeResolved();
+      } catch {
+        log(`pending card record failed id=${job.id}`);
+      }
+    }
+    inflight.delete(job.key);
+    noteFinished();
+    pump();
+  }
+
+  /**
+   * Projected cards, plus every raw id the daemon still lists.
+   * `null` when the list cannot be trusted.
+   * @returns {Promise<{ cards: Record<string, unknown>[], seen: Set<string> } | null>}
    */
   async function readCards() {
     /** @type {{ status: number, json: unknown }} */
@@ -162,16 +249,19 @@ export function createPendingWatcher(options) {
     }
     /** @type {Record<string, unknown>[]} */
     const cards = [];
+    const seen = new Set();
     for (const raw of result.json.pending) {
+      if (isPlain(raw) && typeof raw.id === 'string' && raw.id.length > 0) seen.add(raw.id);
       const card = projectCard(raw);
       if (!card) {
         noteDropped(raw);
         continue;
       }
+      seen.add(String(card.id));
       cards.push(card);
     }
     cards.sort((a, b) => Number(a.created_at) - Number(b.created_at) || String(a.id).localeCompare(String(b.id)));
-    return cards;
+    return { cards, seen };
   }
 
   /**
@@ -191,11 +281,26 @@ export function createPendingWatcher(options) {
     });
   }
 
+  /**
+   * @param {'pending' | 'resolved'} event
+   * @param {Record<string, unknown>} card
+   * @returns {boolean} `false` when the job did not fit and was not recorded.
+   */
+  function recordOrEnqueue(event, card) {
+    if (!webhook) {
+      store.save(String(card.id), event, card, now());
+      if (event === 'resolved') store.purgeResolved();
+      return true;
+    }
+    return acceptDelivery(event, card);
+  }
+
   async function once() {
     if (stopped) return;
-    const cards = await readCards();
-    if (!cards) return;
-    const seen = new Set(cards.map((card) => String(card.id)));
+    const loaded = await readCards();
+    if (!loaded) return;
+    const { cards, seen } = loaded;
+    let queueFull = false;
     for (const card of cards) {
       if (stopped) return;
       const id = String(card.id);
@@ -205,13 +310,13 @@ export function createPendingWatcher(options) {
         if (row.projection !== text) store.save(id, 'pending', card, now());
         continue;
       }
-      await emit('pending', card);
-      if (stopped) return;
-      store.save(id, 'pending', card, now());
+      if (inflight.has(`pending:${id}`)) continue;
+      if (!recordOrEnqueue('pending', card)) queueFull = true;
     }
     for (const row of store.open()) {
       if (stopped) return;
       if (seen.has(row.id)) continue;
+      if (inflight.has(`pending:${row.id}`) || inflight.has(`resolved:${row.id}`)) continue;
       let card;
       try {
         const parsed = JSON.parse(row.projection);
@@ -224,11 +329,10 @@ export function createPendingWatcher(options) {
         store.save(row.id, 'resolved', { id: row.id }, now());
         continue;
       }
-      await emit('resolved', card);
-      if (stopped) return;
-      store.save(row.id, 'resolved', card, now());
+      if (!recordOrEnqueue('resolved', card)) queueFull = true;
     }
     if (!stopped) store.purgeResolved();
+    if (queueFull) log('pending delivery queue is full');
   }
 
   function poll() {
@@ -248,10 +352,15 @@ export function createPendingWatcher(options) {
   return {
     poll,
     idle() {
-      return chain;
+      return chain.then(() => deliveryIdle);
     },
     stop() {
       stopped = true;
+      const dropped = queue.splice(0);
+      for (const job of dropped) {
+        inflight.delete(job.key);
+        noteFinished();
+      }
     },
     /**
      * @param {{ mission_id?: unknown, limit?: unknown }} [args]
@@ -278,7 +387,7 @@ export function createPendingWatcher(options) {
       /** @type {Record<string, unknown>[]} */
       const cards = [];
       for (const raw of result.json.pending) {
-        const card = projectCard(raw);
+        const card = projectListedCard(raw);
         if (!card) {
           noteDropped(raw);
           continue;
