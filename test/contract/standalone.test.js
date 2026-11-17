@@ -72,6 +72,23 @@ const FORBIDDEN = [
   ['GET', '/api/missions/abc?x=1'],
   ['GET', '/api/missions/ab%2fcd'],
   ['GET', '/api/missions/../tasks'],
+  ['POST', '/api/pipelines'],
+  ['PUT', '/api/pipelines/pipe-1'],
+  ['DELETE', '/api/pipelines/pipe-1'],
+  ['POST', '/api/routines'],
+  ['PUT', '/api/routines/routine-1'],
+  ['DELETE', '/api/routines/routine-1'],
+  ['POST', '/api/workflows'],
+  ['PUT', '/api/workflows/wf-1'],
+  ['DELETE', '/api/workflows/wf-1'],
+  ['POST', '/api/workflows/wf-1/publish'],
+  ['GET', '/api/workflows/runs'],
+  ['GET', '/api/workflows/node-types'],
+  ['GET', '/api/workflows/runs/run-wf-1'],
+  ['POST', '/api/workflows/import/pipeline/pipe-1'],
+  ['GET', '/api/pipelines?limit=1'],
+  ['GET', '/api/pipelines/ab%2fcd'],
+  ['GET', '/api/workflows/%2e%2e'],
 ];
 
 test('the daemon client refuses every route outside the closed list', async (t) => {
@@ -92,7 +109,7 @@ test('the daemon client refuses every route outside the closed list', async (t) 
     rmSync(dir, { recursive: true, force: true });
   });
 
-  assert.equal(DAEMON_ROUTES.length, 17);
+  assert.equal(DAEMON_ROUTES.length, 27);
   for (const [method, path] of FORBIDDEN) {
     await assert.rejects(() => client.request(method, path), (err) => {
       assert.equal(err.code, 'route_denied');

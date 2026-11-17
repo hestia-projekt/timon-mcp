@@ -32,6 +32,20 @@ export async function startFakeDaemon(options) {
   let failNext = null;
   /** @type {unknown} */
   let taskListOverride = null;
+  /** @type {unknown} */
+  let pipelinesListOverride = null;
+  /** @type {unknown} */
+  let workflowGetOverride = null;
+  /** @type {Map<string, Record<string, unknown>>} */
+  const pipelines = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const pipelineRuns = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const workflows = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const workflowRuns = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const routines = new Map();
 
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
@@ -40,6 +54,11 @@ export async function startFakeDaemon(options) {
   projects.set('beta', projectRow('beta', { name: 'Beta', status: 'paused' }));
   projects.set('/secret/skip', projectRow('/secret/skip', { name: 'Nope', status: 'active' }));
   for (const agent of seededAgents()) agents.set(String(agent.name), agent);
+  for (const pipeline of seededPipelines()) pipelines.set(String(pipeline.id), pipeline);
+  pipelineRuns.set('prun-1', seededPipelineRun());
+  for (const workflow of seededWorkflows()) workflows.set(String(workflow.id), workflow);
+  for (const run of seededWorkflowRuns()) workflowRuns.set(String(run.id), run);
+  for (const routine of seededRoutines()) routines.set(String(routine.id), routine);
 
   if (options.foreignTaskId) {
     tasks.set(options.foreignTaskId, taskRow(options.foreignTaskId, {
@@ -344,6 +363,15 @@ export async function startFakeDaemon(options) {
       send(res, 201, { message_id: row.message_id, created_at: row.created_at });
       return;
     }
+    if (serveAutomation(method, url.pathname, bodyText, res, {
+      pipelines,
+      pipelineRuns,
+      workflows,
+      workflowRuns,
+      routines,
+      pipelinesListOverride,
+      workflowGetOverride,
+    })) return;
     send(res, 500, { error: 'unexpected route' });
   });
 
@@ -365,6 +393,11 @@ export async function startFakeDaemon(options) {
     projects,
     agents,
     messages,
+    pipelines,
+    pipelineRuns,
+    workflows,
+    workflowRuns,
+    routines,
     /**
      * @param {{ status: number, body?: unknown, redirect?: boolean }} next
      */
@@ -375,6 +408,18 @@ export async function startFakeDaemon(options) {
      * @param {unknown} body
      */
     setTaskList(body) { taskListOverride = body; },
+    /**
+     * Body of the next `GET /api/pipelines`, instead of the stored rows.
+     * `null` restores the stored rows.
+     * @param {unknown} body
+     */
+    setPipelinesList(body) { pipelinesListOverride = body; },
+    /**
+     * Body of the next `GET /api/workflows/:id`, instead of the stored row.
+     * `null` restores the stored row. The path is still matched.
+     * @param {unknown} body
+     */
+    setWorkflowGet(body) { workflowGetOverride = body; },
     close() {
       return new Promise((resolve) => {
         server.close(() => resolve());
@@ -583,4 +628,458 @@ function parseBody(text) {
 function send(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+/**
+ * Pipelines as `GET /api/pipelines` returns them in release 0.1.8 (`asPipeline`):
+ * `definition` is already parsed, and the row still carries the owner and the
+ * step prompts and overrides. `pipe-2` keeps `definition` as a string so the
+ * host projection is checked on both forms. Order is `updated_at DESC`.
+ */
+function seededPipelines() {
+  return [
+    {
+      id: 'pipe-1',
+      name: 'Feature flow',
+      description: 'Plan and code',
+      definition: {
+        steps: [
+          {
+            id: 'plan',
+            agent: 'alpha.researcher',
+            type: 'research',
+            prompt: 'Plan {{input.feature}}\nSECRET PIPELINE PROMPT',
+            priority: 2,
+            deps_on: [],
+            model_override: 'hidden-model',
+            extra_skills: ['secret-skill'],
+            permission_mode_override: 'bypass',
+          },
+          {
+            id: 'code',
+            agent: 'alpha.coder',
+            type: 'code',
+            prompt: 'Code {{ input.feature }}',
+            deps_on: ['plan'],
+            extra_mcp_servers: ['secret-mcp'],
+            extra_allowed_tools: ['secret_tool'],
+          },
+        ],
+      },
+      owner_user_id: 'hidden-owner',
+      created_at: 10,
+      updated_at: 11,
+    },
+    {
+      id: 'pipe-2',
+      name: 'Spare',
+      description: null,
+      definition: JSON.stringify({
+        steps: [
+          {
+            id: 'only',
+            agent: 'alpha.coder',
+            type: 'chore',
+            prompt: 'SECRET PIPELINE PROMPT {{input.spare}}',
+            deps_on: [],
+          },
+        ],
+      }),
+      owner_user_id: 'hidden-owner',
+      created_at: 1,
+      updated_at: 1,
+    },
+  ];
+}
+
+/**
+ * `GET /api/pipelines/runs/:runId` (`getRunStatus`), plus step fields the
+ * release does not send. The host must drop `input`, `description`, and
+ * `model_override`.
+ */
+function seededPipelineRun() {
+  return {
+    run: {
+      run_id: 'prun-1',
+      pipeline_id: 'pipe-1',
+      pipeline_name: 'Feature flow',
+      started_at: 100,
+      input: { feature: 'SECRET INPUT' },
+    },
+    steps: [
+      {
+        step_id: 'plan',
+        task_id: 'task-plan',
+        title: 'Feature flow · plan',
+        agent: 'alpha.researcher',
+        type: 'research',
+        status: 'PENDING',
+        mission_id: null,
+        description: 'SECRET PIPELINE PROMPT',
+        model_override: 'hidden-model',
+      },
+      {
+        step_id: 'code',
+        task_id: 'task-code',
+        title: 'Feature flow · code',
+        agent: 'alpha.coder',
+        type: 'code',
+        status: 'PENDING',
+        mission_id: 'mission-code-1',
+        description: 'SECRET PIPELINE PROMPT',
+        model_override: 'hidden-model',
+      },
+    ],
+  };
+}
+
+/**
+ * Workflow rows as stored (`draft` is a JSON string). The list route spreads
+ * the row, so the draft leaves the daemon. The host must not return it.
+ */
+function seededWorkflows() {
+  return [
+    {
+      id: 'wf-1',
+      slug: 'feature.flow',
+      name: 'Feature',
+      description: 'A workflow',
+      project: 'alpha',
+      owner_user_id: 'hidden-owner',
+      draft: JSON.stringify({
+        nodes: [
+          { id: 'start', type: 'trigger.manual', config: { prompt: 'SECRET WORKFLOW DRAFT' } },
+          { id: 'agent', type: 'agent', config: { prompt: 'SECRET WORKFLOW DRAFT', script: 'SECRET WORKFLOW DRAFT' } },
+        ],
+      }),
+      published_version: 1,
+      enabled: 1,
+      created_at: 20,
+      updated_at: 21,
+      agent_name: 'alpha.orchestrator',
+    },
+    {
+      id: 'wf-2',
+      slug: 'other',
+      name: 'Other',
+      description: null,
+      project: 'beta',
+      owner_user_id: 'hidden-owner',
+      draft: JSON.stringify({
+        nodes: [
+          { id: 'script', type: 'script', config: { code: 'SECRET WORKFLOW DRAFT' } },
+        ],
+      }),
+      published_version: null,
+      enabled: 0,
+      created_at: 1,
+      updated_at: 2,
+      agent_name: 'beta.coder',
+    },
+  ];
+}
+
+/**
+ * `workflow_runs` columns. `context`, `input`, and `trigger` are JSON text
+ * and stay on the row. List order is `started_at DESC`.
+ */
+function seededWorkflowRuns() {
+  return [
+    {
+      id: 'run-wf-1',
+      workflow_id: 'wf-1',
+      version: 1,
+      status: 'running',
+      trigger: JSON.stringify({ kind: 'api', note: 'SECRET TRIGGER' }),
+      input: JSON.stringify({ feature: 'SECRET INPUT' }),
+      context: JSON.stringify({ note: 'SECRET WORKFLOW CONTEXT' }),
+      error: null,
+      started_at: 30,
+      ended_at: null,
+      owner_user_id: 'hidden-owner',
+      tokens_in: 4,
+      tokens_out: 5,
+      cost_usd: 0.01,
+    },
+    {
+      id: 'run-wf-old',
+      workflow_id: 'wf-1',
+      version: 1,
+      status: 'ok',
+      trigger: JSON.stringify({ kind: 'api', note: 'SECRET TRIGGER' }),
+      input: JSON.stringify({ feature: 'SECRET INPUT' }),
+      context: JSON.stringify({ note: 'SECRET WORKFLOW CONTEXT' }),
+      error: null,
+      started_at: 10,
+      ended_at: 12,
+      owner_user_id: 'hidden-owner',
+      tokens_in: 1,
+      tokens_out: 1,
+      cost_usd: 0,
+    },
+  ];
+}
+
+/**
+ * Routine view (`ROUTINE_VIEW`): the prompt and the owner are on the row.
+ * `routine-2` keeps a project the host must not return, and a `next_run_at`
+ * while it is disabled.
+ */
+function seededRoutines() {
+  return [
+    {
+      id: 'routine-1',
+      name: 'Nightly',
+      agent_name: 'alpha.coder',
+      prompt: 'SECRET ROUTINE PROMPT',
+      task_type: 'chore',
+      cron_expr: '30 3 * * *',
+      enabled: 1,
+      project: 'alpha',
+      owner_user_id: 'hidden-owner',
+      last_run_at: 40,
+      next_run_at: 50,
+      created_at: 5,
+      updated_at: 6,
+    },
+    {
+      id: 'routine-2',
+      name: 'Hidden',
+      agent_name: 'beta.coder',
+      prompt: 'SECRET ROUTINE PROMPT',
+      task_type: 'code',
+      cron_expr: '0 4 * * *',
+      enabled: 0,
+      project: '/secret/beta',
+      owner_user_id: 'hidden-owner',
+      last_run_at: null,
+      next_run_at: 60,
+      created_at: 1,
+      updated_at: 2,
+    },
+  ];
+}
+
+/**
+ * Routes of release 0.1.8 that the host is allowed to call, plus the secret
+ * fields those responses carry. Returns false when the path is not one of them.
+ * @param {string} method
+ * @param {string} pathname
+ * @param {string} bodyText
+ * @param {import('node:http').ServerResponse} res
+ * @param {object} store
+ */
+function serveAutomation(method, pathname, bodyText, res, store) {
+  const {
+    pipelines, pipelineRuns, workflows, workflowRuns, routines,
+    pipelinesListOverride, workflowGetOverride,
+  } = store;
+
+  if (method === 'GET' && pathname === '/api/pipelines') {
+    if (pipelinesListOverride !== null) {
+      send(res, 200, pipelinesListOverride);
+      return true;
+    }
+    const rows = [...pipelines.values()].sort((a, b) => Number(b.updated_at) - Number(a.updated_at));
+    send(res, 200, { pipelines: rows });
+    return true;
+  }
+
+  const runStatus = pathname.match(/^\/api\/pipelines\/runs\/([^/]+)$/);
+  if (method === 'GET' && runStatus) {
+    const run = pipelineRuns.get(runStatus[1]);
+    if (!run) {
+      send(res, 404, { error: 'run not found' });
+      return true;
+    }
+    send(res, 200, run);
+    return true;
+  }
+
+  const pipeRun = pathname.match(/^\/api\/pipelines\/([^/]+)\/run$/);
+  if (method === 'POST' && pipeRun) {
+    const pipeline = pipelines.get(pipeRun[1]);
+    if (!pipeline) {
+      send(res, 404, { error: 'pipeline not found', code: 'pipeline_not_found' });
+      return true;
+    }
+    const body = parseBody(bodyText);
+    const runId = `prun-${pipelineRuns.size + 1}`;
+    const startedAt = 1_700_000_000_100;
+    const payload = {
+      run_id: runId,
+      pipeline_id: pipeline.id,
+      started_at: startedAt,
+      steps: [
+        { step_id: 'plan', task_id: 'task-plan', prompt: 'SECRET PIPELINE PROMPT', model_override: 'hidden-model' },
+        { step_id: 'code', task_id: 'task-code', prompt: 'SECRET PIPELINE PROMPT' },
+      ],
+    };
+    pipelineRuns.set(runId, {
+      run: {
+        run_id: runId,
+        pipeline_id: pipeline.id,
+        pipeline_name: pipeline.name,
+        started_at: startedAt,
+        input: body.input ?? null,
+      },
+      steps: [
+        {
+          step_id: 'plan',
+          task_id: 'task-plan',
+          title: `${pipeline.name} · plan`,
+          agent: 'alpha.researcher',
+          type: 'research',
+          status: 'PENDING',
+          mission_id: null,
+          description: 'SECRET PIPELINE PROMPT',
+          model_override: 'hidden-model',
+        },
+        {
+          step_id: 'code',
+          task_id: 'task-code',
+          title: `${pipeline.name} · code`,
+          agent: 'alpha.coder',
+          type: 'code',
+          status: 'PENDING',
+          mission_id: 'mission-code-1',
+          description: 'SECRET PIPELINE PROMPT',
+          model_override: 'hidden-model',
+        },
+      ],
+    });
+    send(res, 201, payload);
+    return true;
+  }
+
+  const onePipe = pathname.match(/^\/api\/pipelines\/([^/]+)$/);
+  if (method === 'GET' && onePipe) {
+    const pipeline = pipelines.get(onePipe[1]);
+    if (!pipeline) {
+      send(res, 404, { error: 'pipeline not found', code: 'pipeline_not_found' });
+      return true;
+    }
+    send(res, 200, { pipeline });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/workflows') {
+    const rows = [...workflows.values()].sort((a, b) => Number(b.updated_at) - Number(a.updated_at));
+    send(res, 200, {
+      workflows: rows.map((workflow) => {
+        const runs = runsOf(workflowRuns, workflow.id);
+        const last = runs[0];
+        return {
+          ...workflow,
+          run_count: runs.length,
+          last_run: last
+            ? { id: last.id, status: last.status, started_at: last.started_at, ended_at: last.ended_at }
+            : null,
+        };
+      }),
+    });
+    return true;
+  }
+
+  const wfRuns = pathname.match(/^\/api\/workflows\/([^/]+)\/runs$/);
+  if (method === 'GET' && wfRuns) {
+    const workflow = findWorkflow(workflows, wfRuns[1]);
+    if (!workflow) {
+      send(res, 404, { error: 'not found', code: 'not_found' });
+      return true;
+    }
+    send(res, 200, { runs: runsOf(workflowRuns, workflow.id) });
+    return true;
+  }
+
+  const wfRun = pathname.match(/^\/api\/workflows\/([^/]+)\/run$/);
+  if (method === 'POST' && wfRun) {
+    const workflow = findWorkflow(workflows, wfRun[1]);
+    if (!workflow) {
+      send(res, 404, { error: 'not found', code: 'not_found' });
+      return true;
+    }
+    if (!workflow.published_version) {
+      send(res, 400, { error: 'workflow has no published version' });
+      return true;
+    }
+    const body = parseBody(bodyText);
+    const id = `run-made-${workflowRuns.size + 1}`;
+    const row = {
+      id,
+      workflow_id: workflow.id,
+      version: workflow.published_version,
+      status: 'running',
+      trigger: JSON.stringify({ kind: 'api', note: 'SECRET TRIGGER' }),
+      input: JSON.stringify(body.input ?? {}),
+      context: JSON.stringify({ note: 'SECRET WORKFLOW CONTEXT', draft: body.draft ?? null }),
+      error: null,
+      started_at: 1_700_000_000_200,
+      ended_at: null,
+      owner_user_id: 'hidden-owner',
+      tokens_in: 4,
+      tokens_out: 5,
+      cost_usd: 0.01,
+    };
+    workflowRuns.set(id, row);
+    send(res, 201, { run: row });
+    return true;
+  }
+
+  const oneWf = pathname.match(/^\/api\/workflows\/([^/]+)$/);
+  if (method === 'GET' && oneWf) {
+    if (workflowGetOverride !== null) {
+      send(res, 200, workflowGetOverride);
+      return true;
+    }
+    const workflow = findWorkflow(workflows, oneWf[1]);
+    if (!workflow) {
+      send(res, 404, { error: 'not found', code: 'not_found' });
+      return true;
+    }
+    send(res, 200, { workflow });
+    return true;
+  }
+
+  if (method === 'GET' && pathname === '/api/routines') {
+    const rows = [...routines.values()].sort((a, b) => Number(b.created_at) - Number(a.created_at));
+    send(res, 200, { routines: rows });
+    return true;
+  }
+
+  const oneRoutine = pathname.match(/^\/api\/routines\/([^/]+)$/);
+  if (method === 'GET' && oneRoutine) {
+    const routine = routines.get(oneRoutine[1]);
+    if (!routine) {
+      send(res, 404, { error: 'not found', code: 'not_found' });
+      return true;
+    }
+    send(res, 200, { routine });
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * @param {Map<string, Record<string, unknown>>} workflows
+ * @param {string} key
+ */
+function findWorkflow(workflows, key) {
+  const direct = workflows.get(key);
+  if (direct) return direct;
+  for (const row of workflows.values()) {
+    if (row.slug === key) return row;
+  }
+  return undefined;
+}
+
+/**
+ * @param {Map<string, Record<string, unknown>>} workflowRuns
+ * @param {string} workflowId
+ */
+function runsOf(workflowRuns, workflowId) {
+  return [...workflowRuns.values()]
+    .filter((run) => run.workflow_id === workflowId)
+    .sort((a, b) => Number(b.started_at) - Number(a.started_at));
 }

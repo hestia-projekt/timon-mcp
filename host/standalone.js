@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { BEARER_SECRET, PLUGIN_ID, WAIT_MAX_S } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
 import { createDaemonClient, resolveDaemonOrigin } from './daemon.js';
+import { createAutomationFacade } from './automation.js';
 import { createMissionFacade, createRosterFacade, createSpawnQuota, createTaskFacade } from './facades.js';
 import { mountMissionTools } from './mission-tools.js';
 import { createResponse, createRouter } from './router.js';
@@ -130,6 +131,7 @@ export async function startStandalone(options = {}) {
     missions: createMissionFacade({ client, sql, quota }),
     kanban: createTaskFacade({ client, sql, quota }),
     roster: createRosterFacade({ client, quota }),
+    automation: createAutomationFacade({ client, quota }),
     events: {
       /**
        * @param {unknown} kind
