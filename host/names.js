@@ -3,7 +3,7 @@
  * The project body is `PROJECT_PATTERN` without its anchors, so a change of
  * that pattern moves this check with it.
  */
-import { PILOT_AGENT, PROJECT_PATTERN } from '../lib/constants.js';
+import { BACKGROUND_IDENTITY, PILOT_AGENT, PROJECT_PATTERN } from '../lib/constants.js';
 
 const PROJECT_BODY = PROJECT_PATTERN.slice(1, -1);
 
@@ -43,6 +43,48 @@ export const TASK_TYPE = new RegExp(`^(?:${TASK_TYPE_NAMES.join('|')})$`);
  * not the mission whose id is that word.
  */
 export const RESERVED_MISSION_IDS = new Set(['latest', 'search', 'delegate']);
+
+/**
+ * Path words the daemon serves under `/api/agents/<word>` as their own routes
+ * (`active`, `spawn`, `ephemeral`, `main`). They are not an agent name.
+ */
+export const RESERVED_AGENT_WORDS = new Set(['active', 'spawn', 'ephemeral', 'main']);
+
+/**
+ * `from_mission` the host sends on `POST /api/messages`.
+ * Release 0.1.8 `dist/notify.js` `SYSTEM_MISSION_ID`. The caller does not choose it.
+ */
+export const DIRECT_FROM_MISSION = '00000000-0000-4000-8000-0000000000aa';
+
+/**
+ * `from_agent` the host sends on `POST /api/messages`.
+ * The plugin background identity. The caller does not choose it.
+ */
+export const DIRECT_FROM_AGENT = BACKGROUND_IDENTITY;
+
+/** Kinds `POST /api/messages` may carry. `request` is the one that wakes the recipient. */
+export const MESSAGE_KIND_NAMES = Object.freeze(['msg', 'request']);
+
+/** Payload kinds `returnPayloadOf` treats as a work return, which wakes the recipient. */
+const WORK_RETURN_KINDS = new Set(['task_closed', 'mission_complete']);
+
+/**
+ * True when a message body would wake an agent even with kind `msg`.
+ * Same rule as `returnPayloadOf` in release 0.1.8: JSON object, `kind` one of
+ * `task_closed` or `mission_complete`.
+ * @param {unknown} text
+ */
+export function isWorkReturnPayload(text) {
+  if (typeof text !== 'string') return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  return WORK_RETURN_KINDS.has(/** @type {{ kind?: unknown }} */ (parsed).kind);
+}
 
 /**
  * @param {unknown} value

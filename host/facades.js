@@ -1,10 +1,11 @@
 /**
- * Mission and task facades for the standalone host.
+ * Mission, task, and roster facades for the standalone host.
  *
  * They speak the same methods as the plugin context, plus the mission tools
  * of the closed list (list every mission, one message, steer, interrupt,
- * stop). The plugin tools still read and write only ids this host created.
- * Nothing here is imported by `lib/`.
+ * stop) and the project and agent tools. The plugin tools still read and
+ * write only ids this host created. Nothing here is imported by `lib/`.
+ * The roster does not call `ctx.agents`.
  */
 import { APPROVAL_MESSAGE, MESSAGE_MAX_CHARS, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
 import { TASK_LIST_TOO_LARGE } from './daemon.js';
@@ -17,12 +18,16 @@ import {
   PluginTaskError,
 } from './errors.js';
 import {
+  DIRECT_FROM_AGENT,
+  DIRECT_FROM_MISSION,
+  MESSAGE_KIND_NAMES,
   isGitRef,
   isMissionId,
   isNamedAgent,
   isProject,
   isTaskStatus,
   isTaskType,
+  isWorkReturnPayload,
 } from './names.js';
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
@@ -70,7 +75,9 @@ const OVERRIDE_EXACT = new Set([
 /**
  * One sliding window for every call that launches or relaunches an agent,
  * and for the two stops (`DELETE /api/missions/:id`, `POST /api/stop`).
- * Reads, the transcript, and `interrupt` do not take a slot.
+ * A direct message of kind `request` takes a slot: release 0.1.8 wakes the
+ * recipient (`callsForTurn`). A `msg` does not. Reads, the transcript, and
+ * `interrupt` do not take a slot.
  * The daemon token is a super-administrator, so the plugin spawn policy
  * does not apply here. Past the ceiling the facade throws `PluginPolicyError`
  * with rule `spawn`, before any network call.
@@ -511,6 +518,208 @@ export function createTaskFacade(deps) {
       return taskFromResult(id, result, 200);
     },
   };
+}
+
+const PROJECT_LIST_KEYS = new Set(['limit']);
+const AGENT_LIST_KEYS = new Set(['project', 'limit']);
+const DIRECT_MESSAGE_KEYS = new Set(['agent', 'message', 'kind']);
+
+/**
+ * Projects and agents. Reads are projections. The direct message fixes
+ * `from_mission` and `from_agent`; the caller cannot supply them.
+ * A `request` takes a quota slot because it wakes the recipient. A `msg` does not.
+ * @param {object} deps
+ * @param {{ request: Function }} deps.client
+ * @param {{ take: Function }} deps.quota
+ */
+export function createRosterFacade(deps) {
+  const { client, quota } = deps;
+
+  return {
+    /**
+     * @param {Record<string, unknown>} [opts]
+     */
+    async listProjects(opts = {}) {
+      const record = isPlain(opts) ? opts : {};
+      refuseRosterKeys(record, PROJECT_LIST_KEYS);
+      const limit = boundedLimit(record.limit, 100, () => new PluginMissionError('invalid', 'limit is invalid'));
+      const result = await callMission(() => client.request('GET', '/api/projects'));
+      if (result.status !== 200 || !isPlain(result.json) || !Array.isArray(result.json.projects)) {
+        throw new PluginMissionError('failed', 'daemon response was refused');
+      }
+      /** @type {{ slug: string, name: string | null, status: string | null }[]} */
+      const rows = [];
+      for (const row of result.json.projects) {
+        if (!isPlain(row)) continue;
+        const projected = projectRosterRow(row);
+        if (projected) rows.push(projected);
+      }
+      rows.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+      return rows.slice(0, limit);
+    },
+
+    /**
+     * @param {Record<string, unknown>} [opts]
+     */
+    async listAgents(opts = {}) {
+      const record = isPlain(opts) ? opts : {};
+      refuseRosterKeys(record, AGENT_LIST_KEYS);
+      const limit = boundedLimit(record.limit, 100, () => new PluginMissionError('invalid', 'limit is invalid'));
+      /** @type {string | undefined} */
+      let project;
+      if (record.project !== undefined) {
+        if (!isProject(record.project)) throw new PluginMissionError('invalid', 'project is invalid');
+        project = record.project;
+      }
+      const result = await callMission(() => client.request('GET', '/api/agents'));
+      if (result.status !== 200 || !isPlain(result.json) || !Array.isArray(result.json.agents)) {
+        throw new PluginMissionError('failed', 'daemon response was refused');
+      }
+      /** @type {ReturnType<typeof agentListRow>[]} */
+      const rows = [];
+      for (const row of result.json.agents) {
+        if (!isPlain(row)) continue;
+        const projected = agentListRow(row);
+        if (!projected) continue;
+        if (project !== undefined && projected.project !== project) continue;
+        rows.push(projected);
+      }
+      rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      return rows.slice(0, limit);
+    },
+
+    /**
+     * State of one agent. The system prompt, privileged config, MCP servers,
+     * secrets, and skills are not copied out.
+     * @param {unknown} name
+     */
+    async read(name) {
+      if (!isNamedAgent(name)) throw new PluginMissionError('invalid', 'agent is invalid');
+      const result = await callMission(() => client.request('GET', `/api/agents/${name}`));
+      if (result.status === 404) throw new PluginMissionError('agent_not_found', 'Agent not found.');
+      if (result.status !== 200 || !isPlain(result.json)) {
+        throw new PluginMissionError('failed', 'daemon response was refused');
+      }
+      const agent = agentDetail(/** @type {Record<string, unknown>} */ (result.json));
+      if (!agent || agent.name !== name) throw new PluginMissionError('failed', 'daemon response was refused');
+      return agent;
+    },
+
+    /**
+     * Direct message. `from_mission` and `from_agent` are the host constants.
+     * Kind `request` wakes the recipient and takes a quota slot. Kind `msg` does not.
+     * @param {unknown} input
+     */
+    async send(input) {
+      const record = plainRecord(input, () => new PluginMissionError('invalid', 'message is required'));
+      refuseRosterKeys(record, DIRECT_MESSAGE_KEYS);
+      if (!isNamedAgent(record.agent)) throw new PluginMissionError('invalid', 'agent is invalid');
+      if (typeof record.message !== 'string' || !record.message.trim() || record.message.length > MESSAGE_MAX_CHARS) {
+        throw new PluginMissionError('invalid', 'message is required');
+      }
+      if (isWorkReturnPayload(record.message)) {
+        throw new PluginMissionError('invalid', 'message must not be a work return');
+      }
+      const kind = record.kind === undefined ? 'msg' : record.kind;
+      if (typeof kind !== 'string' || !MESSAGE_KIND_NAMES.includes(kind)) {
+        throw new PluginMissionError('invalid', 'kind is invalid');
+      }
+      if (kind === 'request') takeSpawn(quota);
+      const result = await callMission(() => client.request('POST', '/api/messages', {
+        to_agent: record.agent,
+        payload: record.message,
+        kind,
+        from_mission: DIRECT_FROM_MISSION,
+        from_agent: DIRECT_FROM_AGENT,
+      }));
+      if (result.status === 404) throw new PluginMissionError('agent_not_found', 'Agent not found.');
+      if (result.status !== 201 || !isPlain(result.json)) {
+        throw new PluginMissionError('invalid', 'message was refused');
+      }
+      const messageId = result.json.message_id;
+      if (typeof messageId !== 'string' || !/^[A-Za-z0-9-]{1,80}$/.test(messageId)) {
+        throw new PluginMissionError('failed', 'daemon response was refused');
+      }
+      return {
+        message_id: messageId,
+        created_at: asStamp(result.json.created_at),
+        agent: record.agent,
+        kind,
+        from_mission: DIRECT_FROM_MISSION,
+        from_agent: DIRECT_FROM_AGENT,
+      };
+    },
+  };
+}
+
+/**
+ * @param {Record<string, unknown>} record
+ * @param {Set<string>} allowed
+ */
+function refuseRosterKeys(record, allowed) {
+  refuseKeys(record, allowed, (key) => {
+    if (key === 'from_mission' || key === 'from_agent' || key.startsWith('from_')) {
+      throw new PluginMissionError('invalid', 'from is fixed by the host');
+    }
+    throw new PluginMissionError('invalid', 'unexpected field');
+  });
+}
+
+/**
+ * `slug`, `name`, `status`. A slug that is not a project name is dropped,
+ * and so is any absolute path (`cwd` is not a field of this object).
+ * @param {Record<string, unknown>} row
+ */
+function projectRosterRow(row) {
+  if (!isProject(row.slug)) return null;
+  return {
+    slug: row.slug,
+    name: safeLabel(row.name, 200),
+    status: safeLabel(row.status, 40),
+  };
+}
+
+/**
+ * List row. Name, role, project, orchestrator. Anything else stays out.
+ * @param {Record<string, unknown>} row
+ */
+function agentListRow(row) {
+  if (!isNamedAgent(row.name)) return null;
+  return {
+    name: row.name,
+    role: safeLabel(row.role, 40),
+    project: isProject(row.project) ? row.project : null,
+    orchestrator: row.orchestrator === true,
+  };
+}
+
+/**
+ * Detail. Adds who the agent reports to, and whether it is ephemeral.
+ * No system prompt, no privileged config, no MCP server, no skill.
+ * @param {Record<string, unknown>} row
+ */
+function agentDetail(row) {
+  const base = agentListRow(row);
+  if (!base) return null;
+  return {
+    ...base,
+    reports_to: isNamedAgent(row.reports_to) ? row.reports_to : null,
+    ephemeral: row.ephemeral === true,
+  };
+}
+
+/**
+ * A short label. A path, a slash, or `..` becomes null so a cwd cannot hide in a name.
+ * @param {unknown} value
+ * @param {number} max
+ * @returns {string | null}
+ */
+function safeLabel(value, max) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > max) return null;
+  if (text.includes('/') || text.includes('\\') || text.includes('..')) return null;
+  return text;
 }
 
 /**

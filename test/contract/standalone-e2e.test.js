@@ -22,6 +22,7 @@ test('initialize, tools/list and ask_main stay on the closed daemon routes', asy
     'list_all_missions', 'get_mission_state', 'get_mission_message', 'send_mission',
     'steer_mission', 'interrupt_mission', 'stop_mission', 'stop_scope', 'launch_mission',
     'list_all_tasks', 'get_task', 'add_task', 'update_task', 'move_task',
+    'list_projects', 'list_agents', 'get_agent', 'send_agent',
   ]);
 
   const asked = await rpc(stack, 'tools/call', {

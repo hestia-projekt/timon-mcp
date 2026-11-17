@@ -8,16 +8,22 @@
  * into the journal, an error message, or a returned document.
  */
 import { readFileSync } from 'node:fs';
+import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
 import { DaemonBodyError, DaemonCallError, DaemonRouteError } from './errors.js';
 import {
+  DIRECT_FROM_AGENT,
+  DIRECT_FROM_MISSION,
   EVENT_ID,
   LIST_LIMIT,
   LIST_STATUS,
+  MESSAGE_KIND_NAMES,
   MISSION_ID,
   NAMED_AGENT,
   PROJECT_NAME,
+  RESERVED_AGENT_WORDS,
   RESERVED_MISSION_IDS,
   TASK_STATUS,
+  isWorkReturnPayload,
 } from './names.js';
 
 /** Longest daemon body this client will parse, except `GET /api/tasks`. */
@@ -37,6 +43,7 @@ export const TASK_LIST_TOO_LARGE = `too_large: GET /api/tasks exceeded ${TASK_LI
 
 const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
 const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
+const AGENT_SEGMENT = NAMED_AGENT.source.slice(1, -1);
 
 /**
  * Couples the host is allowed to call. `:id` is one mission id.
@@ -134,6 +141,31 @@ export const DAEMON_ROUTES = Object.freeze([
     ]),
     bodyRequired: Object.freeze([]),
   }),
+  Object.freeze({
+    name: 'projects.list',
+    method: 'GET',
+    path: '/api/projects',
+  }),
+  Object.freeze({
+    name: 'agents.list',
+    method: 'GET',
+    path: '/api/agents',
+  }),
+  Object.freeze({
+    // `:name` is `_main` or `<project>.<role>`. `active`, `spawn`, `ephemeral`,
+    // and `main` are their own daemon routes and never match this pattern.
+    name: 'agents.get',
+    method: 'GET',
+    path: '/api/agents/:name',
+  }),
+  Object.freeze({
+    name: 'messages.send',
+    method: 'POST',
+    path: '/api/messages',
+    // `from_mission` and `from_agent` are present, and their values are fixed
+    // by `assertDirectMessage`. A caller-supplied value is refused here.
+    body: Object.freeze(['to_agent', 'payload', 'kind', 'from_mission', 'from_agent']),
+  }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
 /**
@@ -143,6 +175,7 @@ function compileRoute(path) {
   const body = path.split('/').map((segment) => {
     if (segment === ':id') return ID_SEGMENT;
     if (segment === ':eventId') return EVENT_SEGMENT;
+    if (segment === ':name') return AGENT_SEGMENT;
     if (segment.startsWith(':') && segment.length > 1) return '[^/]+';
     return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }).join('/');
@@ -187,7 +220,7 @@ export function matchDaemonRoute(method, path) {
     return null;
   }
   if (decoded !== path) return null;
-  if (reservedMissionPath(path)) return null;
+  if (reservedMissionPath(path) || reservedAgentPath(path)) return null;
   const upper = method.toUpperCase();
   return DAEMON_ROUTES.find((route) => route.method === upper && route.re.test(path)) ?? null;
 }
@@ -201,6 +234,18 @@ function reservedMissionPath(path) {
   const parts = path.split('/');
   if (parts[1] !== 'api' || parts[2] !== 'missions') return false;
   return RESERVED_MISSION_IDS.has(parts[3]);
+}
+
+/**
+ * `GET /api/agents/active` and the write routes under `spawn`, `ephemeral`,
+ * and `main` are real daemon routes. The `:name` pattern must not carry
+ * those words.
+ * @param {string} path
+ */
+function reservedAgentPath(path) {
+  const parts = path.split('/');
+  if (parts[1] !== 'api' || parts[2] !== 'agents' || parts.length !== 4) return false;
+  return RESERVED_AGENT_WORDS.has(parts[3]);
 }
 
 /**
@@ -400,6 +445,31 @@ function assertBody(route, method, path, body) {
   for (const key of keys) {
     if (!allowed.has(key)) throw new DaemonRouteError(method, path);
   }
+  if (route.name === 'messages.send') assertDirectMessage(method, path, body);
+}
+
+/**
+ * Exact direct-message body. `from_mission` and `from_agent` are the host's
+ * constants. Any other value, including one supplied by the caller, is refused.
+ * A work-return payload is refused: release 0.1.8 would wake the recipient.
+ * @param {string} method
+ * @param {string} path
+ * @param {Record<string, unknown>} body
+ */
+function assertDirectMessage(method, path, body) {
+  if (body.from_mission !== DIRECT_FROM_MISSION || body.from_agent !== DIRECT_FROM_AGENT) {
+    throw new DaemonRouteError(method, path);
+  }
+  if (typeof body.to_agent !== 'string' || !NAMED_AGENT.test(body.to_agent)) {
+    throw new DaemonRouteError(method, path);
+  }
+  if (typeof body.kind !== 'string' || !MESSAGE_KIND_NAMES.includes(body.kind)) {
+    throw new DaemonRouteError(method, path);
+  }
+  if (typeof body.payload !== 'string' || body.payload.length < 1 || body.payload.length > MESSAGE_MAX_CHARS) {
+    throw new DaemonRouteError(method, path);
+  }
+  if (isWorkReturnPayload(body.payload)) throw new DaemonRouteError(method, path);
 }
 
 /**
