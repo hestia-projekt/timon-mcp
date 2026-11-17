@@ -65,10 +65,81 @@ export async function startFakeDaemon(options) {
       send(res, 201, payload);
       return;
     }
-    if (method === 'GET' && url.pathname.startsWith('/api/missions/')) {
-      const id = url.pathname.slice('/api/missions/'.length);
-      const mission = missions.get(id);
-      if (!mission || id.includes('/')) {
+    if (method === 'GET' && url.pathname === '/api/missions') {
+      const agent = url.searchParams.get('agent');
+      const project = url.searchParams.get('project');
+      const status = url.searchParams.get('status');
+      const limit = Number(url.searchParams.get('limit') ?? '100');
+      let rows = [...missions.values()];
+      if (agent) rows = rows.filter((row) => row.agent_name === agent);
+      else if (project) {
+        rows = rows.filter((row) => row.agent_name === project || row.agent_name.startsWith(`${project}.`));
+      }
+      if (status) rows = rows.filter((row) => row.status === status);
+      send(res, 200, { missions: rows.slice(0, Number.isInteger(limit) ? limit : 100) });
+      return;
+    }
+    const messagePath = url.pathname.match(/^\/api\/missions\/([^/]+)\/messages\/([^/]+)$/);
+    if (method === 'GET' && messagePath) {
+      const id = messagePath[1];
+      const eventId = messagePath[2];
+      if (!missions.has(id)) {
+        send(res, 404, { error: 'mission not found', code: 'mission_not_found' });
+        return;
+      }
+      const stored = storedMessage(id, eventId);
+      if (!stored) {
+        send(res, 404, { error: 'no message with that id', code: 'message_not_found' });
+        return;
+      }
+      send(res, 200, { mission_id: id, ...stored, payload: 'hidden-payload', mission: 'FULL PROMPT' });
+      return;
+    }
+    const steerPath = url.pathname.match(/^\/api\/missions\/([^/]+)\/steer$/);
+    if (method === 'POST' && steerPath) {
+      if (!missions.has(steerPath[1])) {
+        send(res, 404, { error: 'no running agent for that mission', code: 'mission_not_running' });
+        return;
+      }
+      const body = parseBody(bodyText);
+      if (typeof body.input !== 'string' || !body.input.trim()) {
+        send(res, 400, { error: 'input (non-empty string) required' });
+        return;
+      }
+      const payload = { ok: true, method: 'stdin' };
+      if (echoToken) payload.leaked = token;
+      send(res, 200, payload);
+      return;
+    }
+    const interruptPath = url.pathname.match(/^\/api\/missions\/([^/]+)\/interrupt$/);
+    if (method === 'POST' && interruptPath) {
+      if (!missions.has(interruptPath[1])) {
+        send(res, 404, { error: 'mission not found', code: 'mission_not_found' });
+        return;
+      }
+      send(res, 200, {
+        ok: true,
+        status: 'interrupted',
+        resumable: false,
+        turnActive: true,
+        backend: 'hidden-backend',
+      });
+      return;
+    }
+    const oneMission = url.pathname.match(/^\/api\/missions\/([^/]+)$/);
+    if (method === 'DELETE' && oneMission) {
+      const mission = missions.get(oneMission[1]);
+      if (!mission || mission.status !== 'running') {
+        send(res, 404, { error: 'no running agent for that mission', code: 'mission_not_running' });
+        return;
+      }
+      mission.status = 'terminated';
+      send(res, 200, { ok: true, outcome: 'killed' });
+      return;
+    }
+    if (method === 'GET' && oneMission) {
+      const mission = missions.get(oneMission[1]);
+      if (!mission) {
         send(res, 404, { error: 'mission not found', code: 'mission_not_found' });
         return;
       }
@@ -79,11 +150,29 @@ export async function startFakeDaemon(options) {
     }
     if (method === 'POST' && url.pathname.startsWith('/api/agents/') && url.pathname.endsWith('/send')) {
       const id = url.pathname.slice('/api/agents/'.length, -'/send'.length);
-      if (!missions.has(id)) {
+      if (!missions.has(id) || id.includes('/')) {
         send(res, 404, { error: 'no running agent for that mission', code: 'mission_not_running' });
         return;
       }
-      send(res, 200, { ok: true });
+      const payload = { ok: true, resumed: false };
+      if (echoToken) payload.leaked = token;
+      send(res, 200, payload);
+      return;
+    }
+    if (method === 'POST' && url.pathname === '/api/stop') {
+      const body = parseBody(bodyText);
+      const kind = typeof body.agent === 'string' ? 'agent' : 'project';
+      const name = kind === 'agent' ? body.agent : body.project;
+      send(res, 200, {
+        ok: true,
+        scope: { kind, name },
+        agents: [name],
+        missions: [{ id: 'foreignmission01', agent: '_main', outcome: 'killed' }],
+        tasks: [{ id: 'task-1', title: 'SECRET TITLE', agent: name, status: 'PENDING' }],
+        messages: [{ text: 'SECRET MESSAGE' }],
+        workflows: [{ id: 'wf-1', workflow: 'hidden' }],
+        triggers: [{ name: 'SECRET TRIGGER' }],
+      });
       return;
     }
     if (method === 'POST' && url.pathname === '/api/tasks') {
@@ -161,9 +250,45 @@ function missionRow(id, agent, echoed) {
     status: 'running',
     title: echoed,
     summary: echoed,
-    started_at: Date.now(),
+    mission: 'FULL PROMPT',
+    started_at: 1_700_000_000_000,
     ended_at: null,
+    exit_code: null,
+    running: true,
+    turn_active: false,
+    turn_complete: true,
+    turn_preparing: false,
+    liveness: 'idle',
+    interrupted_reason: null,
+    source_channel: 'user',
+    origin: 'user',
+    parent_mission_id: null,
+    parent_agent: null,
+    task_id: null,
+    routine_id: null,
+    pending_action_at: null,
+    pending_action_id: null,
+    backend_override: 'hidden-backend',
+    model_override: 'hidden-model',
+    cwd_override: '/secret/cwd',
+    owner: { id: 'user-1', name: 'hidden-owner' },
+    tokens_in: 9,
+    children: [],
   };
+}
+
+/**
+ * @param {string} missionId
+ * @param {string} eventId
+ */
+function storedMessage(missionId, eventId) {
+  if (eventId === '1') {
+    return { event_id: 1, role: 'agent', timestamp: 10, text: `hello from ${missionId}` };
+  }
+  if (eventId === '2') {
+    return { event_id: 2, role: 'user', timestamp: 11, text: `${'a'.repeat(20_000)}TAIL` };
+  }
+  return null;
 }
 
 /**

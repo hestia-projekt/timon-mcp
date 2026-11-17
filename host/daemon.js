@@ -2,29 +2,98 @@
  * Closed HTTP client for the local daemon.
  *
  * The daemon token is a super-administrator credential. This module is the
- * only place that may open a socket to the daemon, and only for the five
- * routes below. Any other method or path throws before `fetch`.
- *
- * The token is read from disk on every call and is never written into the
- * journal, an error message, or a returned document.
+ * only place that may open a socket to the daemon, and only for the routes
+ * below. Any other method, path, query key, or body field throws before
+ * `fetch`. The token is read from disk on every call and is never written
+ * into the journal, an error message, or a returned document.
  */
 import { readFileSync } from 'node:fs';
 import { DaemonCallError, DaemonRouteError } from './errors.js';
+import {
+  EVENT_ID,
+  LIST_LIMIT,
+  LIST_STATUS,
+  MISSION_ID,
+  NAMED_AGENT,
+  PROJECT_NAME,
+  RESERVED_MISSION_IDS,
+} from './names.js';
 
 /** Longest daemon body this client will parse. */
 const RESPONSE_MAX_BYTES = 1024 * 1024;
 
+const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
+const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
+
 /**
- * Couples the host is allowed to call. `:id` is one path segment.
- * `GET /api/missions` and `GET /api/tasks` are absent on purpose: those
- * listings would return every row on the install.
+ * Couples the host is allowed to call. `:id` is one mission id.
+ * `GET /api/missions/:id` always asks `view=status`: the chat view would
+ * return the transcript. The list's query keys are the only ones accepted,
+ * and only when passed as `query`, never as a string glued to the path.
  */
 export const DAEMON_ROUTES = Object.freeze([
-  Object.freeze({ name: 'missions.spawn', method: 'POST', path: '/api/missions' }),
-  Object.freeze({ name: 'missions.get', method: 'GET', path: '/api/missions/:id' }),
-  Object.freeze({ name: 'missions.send', method: 'POST', path: '/api/agents/:id/send' }),
-  Object.freeze({ name: 'tasks.add', method: 'POST', path: '/api/tasks' }),
-  Object.freeze({ name: 'tasks.get', method: 'GET', path: '/api/tasks/:id' }),
+  Object.freeze({
+    name: 'missions.spawn',
+    method: 'POST',
+    path: '/api/missions',
+    body: Object.freeze(['agent', 'mission']),
+  }),
+  Object.freeze({
+    name: 'missions.list',
+    method: 'GET',
+    path: '/api/missions',
+    query: Object.freeze(['project', 'agent', 'status', 'limit']),
+  }),
+  Object.freeze({
+    name: 'missions.get',
+    method: 'GET',
+    path: '/api/missions/:id',
+    fixedQuery: 'view=status',
+  }),
+  Object.freeze({
+    name: 'missions.message',
+    method: 'GET',
+    path: '/api/missions/:id/messages/:eventId',
+  }),
+  Object.freeze({
+    name: 'missions.send',
+    method: 'POST',
+    path: '/api/agents/:id/send',
+    body: Object.freeze(['input']),
+  }),
+  Object.freeze({
+    name: 'missions.steer',
+    method: 'POST',
+    path: '/api/missions/:id/steer',
+    body: Object.freeze(['input']),
+  }),
+  Object.freeze({
+    name: 'missions.interrupt',
+    method: 'POST',
+    path: '/api/missions/:id/interrupt',
+  }),
+  Object.freeze({
+    name: 'missions.stop',
+    method: 'DELETE',
+    path: '/api/missions/:id',
+  }),
+  Object.freeze({
+    name: 'missions.stopScope',
+    method: 'POST',
+    path: '/api/stop',
+    body: 'stop-scope',
+  }),
+  Object.freeze({
+    name: 'tasks.add',
+    method: 'POST',
+    path: '/api/tasks',
+    body: Object.freeze(['title', 'description', 'agent_name', 'type', 'project']),
+  }),
+  Object.freeze({
+    name: 'tasks.get',
+    method: 'GET',
+    path: '/api/tasks/:id',
+  }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
 /**
@@ -32,6 +101,8 @@ export const DAEMON_ROUTES = Object.freeze([
  */
 function compileRoute(path) {
   const body = path.split('/').map((segment) => {
+    if (segment === ':id') return ID_SEGMENT;
+    if (segment === ':eventId') return EVENT_SEGMENT;
     if (segment.startsWith(':') && segment.length > 1) return '[^/]+';
     return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }).join('/');
@@ -66,7 +137,9 @@ export function resolveDaemonOrigin(raw) {
  */
 export function matchDaemonRoute(method, path) {
   if (typeof method !== 'string' || typeof path !== 'string') return null;
-  if (!path.startsWith('/') || path.includes('?') || path.includes('\\') || path.includes('..')) return null;
+  if (!path.startsWith('/') || path.includes('?') || path.includes('#') || path.includes('\\') || path.includes('..')) {
+    return null;
+  }
   let decoded;
   try {
     decoded = decodeURIComponent(path);
@@ -74,8 +147,20 @@ export function matchDaemonRoute(method, path) {
     return null;
   }
   if (decoded !== path) return null;
+  if (reservedMissionPath(path)) return null;
   const upper = method.toUpperCase();
   return DAEMON_ROUTES.find((route) => route.method === upper && route.re.test(path)) ?? null;
+}
+
+/**
+ * `GET /api/missions/latest` and `GET /api/missions/search` are real daemon
+ * routes. The `:id` pattern would otherwise carry those words to them.
+ * @param {string} path
+ */
+function reservedMissionPath(path) {
+  const parts = path.split('/');
+  if (parts[1] !== 'api' || parts[2] !== 'missions') return false;
+  return RESERVED_MISSION_IDS.has(parts[3]);
 }
 
 /**
@@ -135,13 +220,15 @@ export function createDaemonClient(options) {
      * @param {string} method
      * @param {string} path Path only. A query string is refused.
      * @param {unknown} [body]
+     * @param {Record<string, string>} [query] Allowlisted keys only. Refused on a route that has none.
      * @returns {Promise<{ status: number, json: unknown }>}
      */
-    async request(method, path, body) {
+    async request(method, path, body, query) {
       const route = matchDaemonRoute(method, path);
       if (!route) throw new DaemonRouteError(method, String(path));
+      const search = queryString(route, method, path, query);
+      assertBody(route, method, path, body);
       const token = readDaemonToken();
-      const query = route.name === 'missions.get' ? '?view=status' : '';
       const headers = {
         accept: 'application/json',
         authorization: `Bearer ${token}`,
@@ -155,7 +242,7 @@ export function createDaemonClient(options) {
       /** @type {Response} */
       let response;
       try {
-        response = await fetch(`${origin}${path}${query}`, {
+        response = await fetch(`${origin}${path}${search}`, {
           method: route.method,
           headers,
           body: payload,
@@ -190,6 +277,97 @@ export function createDaemonClient(options) {
       return { status: response.status, json };
     },
   };
+}
+
+/**
+ * @param {{ fixedQuery?: string, query?: readonly string[] }} route
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} query
+ * @returns {string}
+ */
+function queryString(route, method, path, query) {
+  if (route.fixedQuery) {
+    if (query !== undefined) throw new DaemonRouteError(method, path);
+    return `?${route.fixedQuery}`;
+  }
+  if (query === undefined) return '';
+  if (!isPlain(query)) throw new DaemonRouteError(method, path);
+  const allowed = Array.isArray(route.query) ? route.query : [];
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(query)) {
+    if (!allowedSet.has(key)) throw new DaemonRouteError(method, path);
+  }
+  const params = new URLSearchParams();
+  for (const key of allowed) {
+    if (query[key] === undefined) continue;
+    if (!queryValueOk(key, query[key])) throw new DaemonRouteError(method, path);
+    params.append(key, query[key]);
+  }
+  const text = params.toString();
+  return text ? `?${text}` : '';
+}
+
+/**
+ * @param {string} key
+ * @param {unknown} value
+ */
+function queryValueOk(key, value) {
+  if (typeof value !== 'string' || value !== value.trim()) return false;
+  if (key === 'project') return PROJECT_NAME.test(value);
+  if (key === 'agent') return NAMED_AGENT.test(value);
+  if (key === 'status') return LIST_STATUS.test(value);
+  if (key === 'limit') return LIST_LIMIT.test(value);
+  return false;
+}
+
+/**
+ * @param {{ body?: readonly string[] | string }} route
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} body
+ */
+function assertBody(route, method, path, body) {
+  if (route.body == null) {
+    if (body !== undefined) throw new DaemonRouteError(method, path);
+    return;
+  }
+  if (route.body === 'stop-scope') {
+    assertStopBody(method, path, body);
+    return;
+  }
+  if (!isPlain(body) || !Array.isArray(route.body)) throw new DaemonRouteError(method, path);
+  const allowed = new Set(route.body);
+  const keys = Object.keys(body);
+  if (keys.length !== allowed.size) throw new DaemonRouteError(method, path);
+  for (const key of keys) {
+    if (!allowed.has(key)) throw new DaemonRouteError(method, path);
+  }
+}
+
+/**
+ * Exactly `{ agent }` or `{ project }`. Anything else, including both, is refused.
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} body
+ */
+function assertStopBody(method, path, body) {
+  if (!isPlain(body)) throw new DaemonRouteError(method, path);
+  const keys = Object.keys(body);
+  if (keys.length !== 1 || (keys[0] !== 'agent' && keys[0] !== 'project')) {
+    throw new DaemonRouteError(method, path);
+  }
+  const value = body[keys[0]];
+  if (keys[0] === 'agent' && !NAMED_AGENT.test(value)) throw new DaemonRouteError(method, path);
+  if (keys[0] === 'project' && !PROJECT_NAME.test(value)) throw new DaemonRouteError(method, path);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isPlain(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**

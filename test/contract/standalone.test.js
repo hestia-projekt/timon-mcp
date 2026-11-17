@@ -18,7 +18,6 @@ const PREFIX = '/api/plugins/timon-mcp';
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
 const FORBIDDEN = [
-  ['DELETE', '/api/missions/abc'],
   ['DELETE', '/api/tasks/abc'],
   ['GET', '/api/agents/abc/config'],
   ['PUT', '/api/agents/abc/config'],
@@ -28,16 +27,28 @@ const FORBIDDEN = [
   ['POST', '/api/plugins'],
   ['DELETE', '/api/plugins/timon-mcp'],
   ['POST', '/api/missions/abc/fork'],
-  ['POST', '/api/missions/abc/interrupt'],
-  ['POST', '/api/missions/abc/steer'],
-  ['GET', '/api/missions'],
+  ['POST', '/api/missions/abc/summarize'],
+  ['POST', '/api/missions/abc/backend'],
+  ['POST', '/api/missions/abc/messages'],
+  ['GET', '/api/missions/abc/stream'],
+  ['GET', '/api/missions/abc/spans'],
+  ['GET', '/api/missions/abc/messages'],
+  ['GET', '/api/missions/abc/messages/0'],
+  ['GET', '/api/missions/abc/messages/01'],
+  ['GET', '/api/missions/abc/messages/%2e%2e'],
+  ['DELETE', '/api/missions/abc/messages/1'],
+  ['GET', '/api/missions/latest'],
+  ['GET', '/api/missions/search'],
+  ['GET', '/api/missions?limit=1'],
+  ['PUT', '/api/stop'],
+  ['GET', '/api/stop'],
+  ['GET', '/api/permissions'],
   ['GET', '/api/tasks'],
   ['PUT', '/api/tasks/abc'],
   ['POST', '/api/tasks/abc/worktree'],
   ['GET', '/api/agents'],
   ['POST', '/api/agents/spawn'],
   ['POST', '/api/missions/delegate'],
-  ['GET', '/api/missions/abc/messages/1'],
   ['POST', '/api/admin'],
   ['GET', '/api/mcp-servers'],
   ['GET', '/api/skills'],
@@ -65,7 +76,7 @@ test('the daemon client refuses every route outside the closed list', async (t) 
     rmSync(dir, { recursive: true, force: true });
   });
 
-  assert.equal(DAEMON_ROUTES.length, 5);
+  assert.equal(DAEMON_ROUTES.length, 11);
   for (const [method, path] of FORBIDDEN) {
     await assert.rejects(() => client.request(method, path), (err) => {
       assert.equal(err.code, 'route_denied');

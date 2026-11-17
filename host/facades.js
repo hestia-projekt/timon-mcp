@@ -1,11 +1,12 @@
 /**
  * Mission and task facades for the standalone host.
  *
- * They speak the same methods as the plugin context. The difference is the
- * transport: five daemon routes, and only ids this host has created. Nothing
- * here is imported by `lib/`.
+ * They speak the same methods as the plugin context, plus the mission tools
+ * of the closed list (list every mission, one message, steer, interrupt,
+ * stop). The plugin tools still read and write only ids this host created.
+ * Nothing here is imported by `lib/`.
  */
-import { APPROVAL_MESSAGE, MESSAGE_MAX_CHARS, PILOT_AGENT, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
+import { APPROVAL_MESSAGE, MESSAGE_MAX_CHARS, PLUGIN_ID, PROJECT_PATTERN } from '../lib/constants.js';
 import {
   DaemonCallError,
   DaemonRouteError,
@@ -13,9 +14,11 @@ import {
   PluginPolicyError,
   PluginTaskError,
 } from './errors.js';
+import { isMissionId, isNamedAgent, isProject } from './names.js';
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+const LIST_STATUS = new Set(['running', 'completed', 'failed', 'terminated']);
+const LIST_FILTERS = new Set(['project', 'agent', 'status', 'limit']);
 /** Ids fetched per list. Both statements apply this bound in SQL. */
 const LIST_GET_MAX = 50;
 /**
@@ -48,7 +51,9 @@ const OVERRIDE_EXACT = new Set([
 ]);
 
 /**
- * One sliding window for `spawn`, `send` and `kanban.add`.
+ * One sliding window for every call that launches or relaunches an agent,
+ * and for the two stops (`DELETE /api/missions/:id`, `POST /api/stop`).
+ * Reads, the transcript, and `interrupt` do not take a slot.
  * The daemon token is a super-administrator, so the plugin spawn policy
  * does not apply here. Past the ceiling the facade throws `PluginPolicyError`
  * with rule `spawn`, before any network call.
@@ -134,15 +139,149 @@ export function createMissionFacade(deps) {
      */
     async send(missionId, text) {
       const id = requireOwned(owned, missionId);
-      if (typeof text !== 'string' || !text || text.length > MESSAGE_MAX_CHARS) {
+      assertSendText(text);
+      takeSpawn(quota);
+      return deliverSend(client, id, text);
+    },
+
+    /**
+     * Same send, for a mission this host did not create. The id is still a
+     * closed shape: a bad id, a reserved word, or an extra field never
+     * reaches the daemon. `text` is the only body field.
+     * @param {unknown} missionId
+     * @param {unknown} text
+     */
+    async sendTo(missionId, text) {
+      const id = requireAnyId(missionId);
+      assertSendText(text);
+      takeSpawn(quota);
+      return deliverSend(client, id, text);
+    },
+
+    /**
+     * State of any mission. `view=status` is fixed by the client, and the
+     * prompt is dropped here. A 404 is "not there".
+     * @param {unknown} missionId
+     */
+    async detail(missionId) {
+      const id = requireAnyId(missionId);
+      const result = await callMission(() => client.request('GET', `/api/missions/${id}`));
+      if (result.status === 404) throw new PluginMissionError('not_found', 'Mission not found.');
+      if (result.status !== 200 || !isPlain(result.json)) throw missionHttpError(result.status, result.json);
+      return projectDetail(/** @type {Record<string, unknown>} */ (result.json));
+    },
+
+    /**
+     * Every mission on the install. Filters are a closed set. The prompt is
+     * not copied out of the daemon row.
+     * @param {Record<string, unknown>} [opts]
+     */
+    async listAll(opts = {}) {
+      const query = listQuery(opts);
+      const result = await callMission(() => client.request('GET', '/api/missions', undefined, query));
+      if (result.status !== 200 || !isPlain(result.json)) throw missionHttpError(result.status, result.json);
+      const rows = /** @type {{ missions?: unknown }} */ (result.json).missions;
+      if (!Array.isArray(rows)) throw new PluginMissionError('failed', 'daemon response was refused');
+      const limit = Number(query.limit);
+      /** @type {Record<string, unknown>[]} */
+      const out = [];
+      for (const row of rows) {
+        if (!isPlain(row)) continue;
+        out.push(projectListRow(row));
+        if (out.length >= limit) break;
+      }
+      return out;
+    },
+
+    /**
+     * One message. The text is cut at `MESSAGE_MAX_CHARS`. The daemon's extra
+     * fields (the raw payload, the prompt) are not returned.
+     * @param {unknown} missionId
+     * @param {unknown} eventId
+     */
+    async message(missionId, eventId) {
+      const id = requireAnyId(missionId);
+      const event = requireEventId(eventId);
+      const result = await callMission(() => client.request('GET', `/api/missions/${id}/messages/${event}`));
+      if (result.status === 404) throw new PluginMissionError('message_not_found', 'Message not found.');
+      if (result.status !== 200 || !isPlain(result.json)) throw missionHttpError(result.status, result.json);
+      return projectMessage(id, event, /** @type {Record<string, unknown>} */ (result.json));
+    },
+
+    /**
+     * Redirects the turn in progress. `input` is the only field sent.
+     * Counts against the spawn window: a steer can resume the agent.
+     * @param {unknown} missionId
+     * @param {unknown} text
+     */
+    async steer(missionId, text) {
+      const id = requireAnyId(missionId);
+      if (typeof text !== 'string' || !text.trim() || text.length > MESSAGE_MAX_CHARS) {
         throw new PluginMissionError('invalid', 'text is required');
       }
       takeSpawn(quota);
-      const result = await callMission(() => client.request('POST', `/api/agents/${id}/send`, { input: text }));
-      if (result.status === 200 && result.json && typeof result.json === 'object' && result.json.ok === true) {
-        return { resumed: result.json.resumed === true };
+      const result = await callMission(() => client.request('POST', `/api/missions/${id}/steer`, { input: text }));
+      if (result.status === 200 && isPlain(result.json) && result.json.ok === true) {
+        const method = result.json.method;
+        return {
+          ok: true,
+          method: typeof method === 'string' && method.length > 0 && method.length <= 40 ? method : null,
+        };
       }
-      throw missionHttpError(result.status, result.json, { send: true });
+      throw missionHttpError(result.status, result.json, { steer: true });
+    },
+
+    /**
+     * Interrupts the turn. Does not take a quota slot: it does not launch.
+     * @param {unknown} missionId
+     */
+    async interrupt(missionId) {
+      const id = requireAnyId(missionId);
+      const result = await callMission(() => client.request('POST', `/api/missions/${id}/interrupt`));
+      if (result.status === 404) throw new PluginMissionError('not_found', 'Mission not found.');
+      if (result.status !== 200 || !isPlain(result.json)) throw missionHttpError(result.status, result.json);
+      return {
+        ok: true,
+        status: typeof result.json.status === 'string' ? result.json.status.slice(0, 40) : null,
+        resumable: result.json.resumable === true,
+        turn_active: result.json.turnActive === true || result.json.turn_active === true,
+      };
+    },
+
+    /**
+     * Stops one mission (`DELETE`). Counts against the window.
+     * @param {unknown} missionId
+     */
+    async stop(missionId) {
+      const id = requireAnyId(missionId);
+      takeSpawn(quota);
+      const result = await callMission(() => client.request('DELETE', `/api/missions/${id}`));
+      if (result.status === 404) throw new PluginMissionError('stop_missed', 'The mission is not running.');
+      if (result.status !== 200 || !isPlain(result.json) || result.json.ok !== true) {
+        throw missionHttpError(result.status, result.json);
+      }
+      const outcome = result.json.outcome;
+      return {
+        ok: true,
+        outcome: outcome === 'killed' || outcome === 'closed' ? outcome : null,
+      };
+    },
+
+    /**
+     * Stops one agent or one project (`POST /api/stop`). Exactly one of the
+     * two fields. Counts against the window. The daemon report is projected:
+     * message bodies and task titles stay out.
+     * @param {unknown} input
+     */
+    async stopScope(input) {
+      const body = stopBody(input);
+      takeSpawn(quota);
+      const result = await callMission(() => client.request('POST', '/api/stop', body));
+      if (result.status === 404) throw new PluginMissionError('not_found', 'Scope not found.');
+      if (result.status !== 200 || !isPlain(result.json) || result.json.ok !== true) {
+        throw missionHttpError(result.status, result.json);
+      }
+      return projectStop(result.json);
     },
 
     /**
@@ -284,7 +423,7 @@ function missionBody(input) {
   });
   const agent = record.agent;
   const mission = record.mission;
-  if (typeof agent !== 'string' || !pilotAgent(agent)) {
+  if (!isNamedAgent(agent)) {
     throw new PluginMissionError('invalid', 'agent is invalid');
   }
   if (typeof mission !== 'string' || !mission.trim() || mission.length > MESSAGE_MAX_CHARS) {
@@ -337,12 +476,24 @@ function taskBody(input) {
 }
 
 /**
- * @param {string} agent
+ * @param {unknown} text
  */
-function pilotAgent(agent) {
-  if (agent === PILOT_AGENT) return true;
-  if (!agent.endsWith('.main')) return false;
-  return PROJECT.test(agent.slice(0, -'.main'.length));
+function assertSendText(text) {
+  if (typeof text !== 'string' || !text || text.length > MESSAGE_MAX_CHARS) {
+    throw new PluginMissionError('invalid', 'text is required');
+  }
+}
+
+/**
+ * @param {string} id
+ * @param {string} text
+ */
+async function deliverSend(client, id, text) {
+  const result = await callMission(() => client.request('POST', `/api/agents/${id}/send`, { input: text }));
+  if (result.status === 200 && isPlain(result.json) && result.json.ok === true) {
+    return { resumed: result.json.resumed === true };
+  }
+  throw missionHttpError(result.status, result.json, { send: true });
 }
 
 /**
@@ -358,8 +509,16 @@ function overrideKey(key) {
  * @returns {Record<string, unknown>}
  */
 function plainRecord(value, invalid) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid();
+  if (!isPlain(value)) throw invalid();
   return /** @type {Record<string, unknown>} */ (value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isPlain(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
@@ -378,8 +537,33 @@ function refuseKeys(record, allowed, reject) {
  * @param {unknown} id
  */
 function isOwned(owned, id) {
-  if (typeof id !== 'string' || !ID_PATTERN.test(id)) return false;
+  if (!isMissionId(id)) return false;
   return Boolean(owned.get(id));
+}
+
+/**
+ * A mission id the daemon may be asked about. Reserved route words are
+ * refused here, before the client, so the tool error names the id.
+ * @param {unknown} id
+ * @returns {string}
+ */
+function requireAnyId(id) {
+  if (!isMissionId(id)) throw new PluginMissionError('invalid', 'mission id is invalid');
+  return id;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function requireEventId(value) {
+  const text = typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? String(value)
+    : value;
+  if (typeof text !== 'string' || !/^[1-9][0-9]{0,14}$/.test(text)) {
+    throw new PluginMissionError('invalid', 'event id is invalid');
+  }
+  return text;
 }
 
 /**
@@ -397,8 +581,60 @@ function requireOwned(owned, id) {
  * @returns {string | null}
  */
 function safeId(value) {
-  if (typeof value !== 'string' || !ID_PATTERN.test(value)) return null;
+  if (!isMissionId(value)) return null;
   return value;
+}
+
+/**
+ * @param {Record<string, unknown>} opts
+ * @returns {Record<string, string>}
+ */
+function listQuery(opts) {
+  const record = isPlain(opts) ? opts : {};
+  refuseKeys(record, LIST_FILTERS, () => {
+    throw new PluginMissionError('invalid', 'unexpected field');
+  });
+  /** @type {Record<string, string>} */
+  const query = {};
+  if (record.project !== undefined) {
+    if (!isProject(record.project)) throw new PluginMissionError('invalid', 'project is invalid');
+    query.project = record.project;
+  }
+  if (record.agent !== undefined) {
+    if (!isNamedAgent(record.agent)) throw new PluginMissionError('invalid', 'agent is invalid');
+    query.agent = record.agent;
+  }
+  if (record.status !== undefined) {
+    if (typeof record.status !== 'string' || !LIST_STATUS.has(record.status)) {
+      throw new PluginMissionError('invalid', 'status is invalid');
+    }
+    query.status = record.status;
+  }
+  const limit = boundedLimit(record.limit, 50, () => new PluginMissionError('invalid', 'limit is invalid'));
+  query.limit = String(limit);
+  return query;
+}
+
+/**
+ * @param {unknown} input
+ * @returns {{ agent: string } | { project: string }}
+ */
+function stopBody(input) {
+  const record = plainRecord(input, () => new PluginMissionError('invalid', 'scope is required'));
+  const keys = Object.keys(record);
+  if (keys.length !== 1 || (keys[0] !== 'agent' && keys[0] !== 'project')) {
+    if (keys.some((key) => overrideKey(key))) {
+      throw new PluginMissionError('override_denied', 'override is not allowed');
+    }
+    throw new PluginMissionError('invalid', 'expected agent or project');
+  }
+  const value = record[keys[0]];
+  if (keys[0] === 'agent') {
+    if (!isNamedAgent(value)) throw new PluginMissionError('invalid', 'agent is invalid');
+    return { agent: value };
+  }
+  if (!isProject(value)) throw new PluginMissionError('invalid', 'project is invalid');
+  return { project: value };
 }
 
 /**
@@ -444,6 +680,168 @@ function pickMission(json) {
   if (typeof json.last_message === 'string') mission.last_message = json.last_message;
   if (Array.isArray(json.messages)) mission.messages = json.messages;
   return mission;
+}
+
+/**
+ * List row. The prompt (`mission`) and every field outside this set are dropped.
+ * @param {Record<string, unknown>} json
+ */
+function projectListRow(json) {
+  return {
+    id: asString(json.id),
+    agent_name: asString(json.agent_name),
+    status: asString(json.status),
+    title: asString(json.title),
+    started_at: asStamp(json.started_at),
+    ended_at: asStamp(json.ended_at),
+    running: asBool(json.running),
+    liveness: asShort(json.liveness),
+    turn_active: asBool(json.turn_active),
+    exit_code: asInt(json.exit_code),
+    task_id: asString(json.task_id),
+  };
+}
+
+/**
+ * Detail. Still no prompt, no transcript, no override, no owner, no cwd.
+ * @param {Record<string, unknown>} json
+ */
+function projectDetail(json) {
+  return {
+    ...projectListRow(json),
+    title_source: asShort(json.title_source),
+    turn_complete: asBool(json.turn_complete),
+    turn_preparing: asBool(json.turn_preparing),
+    interrupted_reason: asShort(json.interrupted_reason),
+    source_channel: asShort(json.source_channel),
+    origin: asShort(json.origin),
+    parent_mission_id: asString(json.parent_mission_id),
+    parent_agent: asString(json.parent_agent),
+    routine_id: asString(json.routine_id),
+    pending_action_at: asStamp(json.pending_action_at),
+    pending_action_id: asString(json.pending_action_id),
+    children: projectChildren(json.children),
+  };
+}
+
+/**
+ * @param {unknown} value
+ */
+function projectChildren(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 20).filter(isPlain).map((row) => ({
+    id: asString(row.id),
+    agent_name: asString(row.agent_name),
+    status: asString(row.status),
+    started_at: asStamp(row.started_at),
+  }));
+}
+
+/**
+ * @param {string} missionId
+ * @param {string} eventId
+ * @param {Record<string, unknown>} json
+ */
+function projectMessage(missionId, eventId, json) {
+  if (json.mission_id !== undefined && json.mission_id !== missionId) {
+    throw new PluginMissionError('failed', 'daemon response was refused');
+  }
+  const reported = json.event_id ?? json.id;
+  if (reported !== undefined && String(reported) !== eventId) {
+    throw new PluginMissionError('failed', 'daemon response was refused');
+  }
+  if (typeof json.text !== 'string') throw new PluginMissionError('failed', 'daemon response was refused');
+  const bounded = boundText(json.text);
+  const role = json.role === 'agent' || json.role === 'user' ? json.role : null;
+  return {
+    mission_id: missionId,
+    event_id: Number(eventId),
+    role,
+    timestamp: asStamp(json.timestamp),
+    text: bounded.text,
+    truncated: bounded.truncated,
+  };
+}
+
+/**
+ * @param {string} text
+ */
+function boundText(text) {
+  if (text.length <= MESSAGE_MAX_CHARS) return { text, truncated: false };
+  let end = MESSAGE_MAX_CHARS;
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return { text: text.slice(0, end), truncated: true };
+}
+
+/**
+ * @param {Record<string, unknown>} json
+ */
+function projectStop(json) {
+  const scope = isPlain(json.scope) ? json.scope : {};
+  const kind = scope.kind === 'agent' || scope.kind === 'project' ? scope.kind : null;
+  const name = typeof scope.name === 'string' && scope.name.length <= 200 ? scope.name : null;
+  const agents = Array.isArray(json.agents)
+    ? json.agents.filter((item) => typeof item === 'string' && item.length <= 200).slice(0, 100)
+    : [];
+  const missions = Array.isArray(json.missions)
+    ? json.missions.filter(isPlain).slice(0, 100).map((row) => {
+      const outcome = row.outcome;
+      return {
+        id: asString(row.id),
+        agent: asString(row.agent ?? row.agent_name),
+        outcome: outcome === 'killed' || outcome === 'closed' || outcome === 'not_found' ? outcome : null,
+      };
+    })
+    : [];
+  return {
+    ok: true,
+    scope: { kind, name },
+    agents,
+    missions,
+    task_count: Array.isArray(json.tasks) ? json.tasks.length : 0,
+    workflow_count: Array.isArray(json.workflows) ? json.workflows.length : 0,
+  };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+function asString(value) {
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+function asShort(value) {
+  return typeof value === 'string' && value.length <= 80 ? value : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {boolean | null}
+ */
+function asBool(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function asStamp(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function asInt(value) {
+  return Number.isInteger(value) ? value : null;
 }
 
 /**
@@ -523,11 +921,14 @@ function asTaskTransport(err) {
 /**
  * @param {number} status
  * @param {unknown} json
- * @param {{ send?: boolean }} [mode]
+ * @param {{ send?: boolean, steer?: boolean }} [mode]
  */
 function missionHttpError(status, json, mode = {}) {
   const code = errorCode(json);
   const message = errorText(json);
+  if (status === 409 && mode.steer) {
+    return new PluginMissionError('no_turn', 'No turn is running. Send a message instead.');
+  }
   if (status === 409 || code === 'turn_in_progress') return new PluginMissionError('turn_in_progress', message);
   if (status === 404 && (code === 'mission_not_running' || mode.send)) {
     return new PluginMissionError('not_running', message);

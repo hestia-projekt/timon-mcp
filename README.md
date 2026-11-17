@@ -232,9 +232,25 @@ The host listens on the loopback interface only. `TIMON_MCP_PORT` chooses the po
 
 The host calls the local daemon over HTTP. `TIMON_DAEMON_URL` must stay on the loopback. The daemon token is read from a file on every call (`TIMON_DAEMON_TOKEN_FILE`, default `~/.timon/daemon-token`) and is never written to a log. The static bearer is the environment variable `TIMON_MCP_BEARER_TOKEN`. Settings are a JSON file (`TIMON_MCP_SETTINGS`) using the same keys as the manifest. State is a sqlite file (`TIMON_MCP_DB`, default `~/.timon-mcp/state.db`) and uses the plugin migrations.
 
-Only five daemon calls are possible: create a mission, read one mission, send a message to it, create a chore task, and read one task. Any other method or path is refused before the network. The host records the missions and tasks it created. Reading and listing refuse an id it did not create. A list reads at most the 50 newest recorded ids. The same call stops after 60 seconds, checked before each of those reads, and fails with a timeout instead of returning the rows already gathered. One read already started can still finish inside its own 20 second cap, so the list stays inside the idle limit below. An id the daemon answers with 404 is dropped from that record. The agent is `_main` or `<project>.main`. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`) are not sent.
+Eleven daemon calls are possible. Five of them serve the plugin tools: create a mission, read one mission the host created, send a message to that mission, create a chore task, and read one task. Six more serve the mission tools below: list every mission, read one message, steer a turn, interrupt a mission, stop one mission, and stop an agent or a project. Any other method, path, query key, or body field is refused before the network. A query string stuck on the path is refused, including an allowlisted key. Query keys are accepted only as the list's allowlist (`project`, `agent`, `status`, `limit`). `%2f` and `..` are refused, and so are the daemon's own words `latest`, `search`, and `delegate` used as a mission id. The host still records the missions and tasks it created. The plugin tools `list_missions`, `get_reply`, and `ask_main` read and write only those recorded ids. A list of recorded ids reads at most the 50 newest. The same call stops after 60 seconds, checked before each of those reads, and fails with a timeout instead of returning the rows already gathered. One read already started can still finish inside its own 20 second cap, so the list stays inside the idle limit below. An id the daemon answers with 404 is dropped from that record.
 
-`spawn`, `send` and task creation share one sliding window. `TIMON_MCP_SPAWN_MAX` is how many of those calls are allowed (default 5). `TIMON_MCP_SPAWN_WINDOW_MS` is the window in milliseconds (default 3600000). Past the ceiling the tool result is `isError`, with the text `waiting for the operator's approval`, and the daemon is not called. The daemon token is a super-administrator, so this ceiling is the host's own quota.
+A launch names an agent that already exists: `_main`, or `<project>.<role>`, where both parts match `^[a-z0-9][a-z0-9-]{0,39}$`. The host does not create the agent. Overrides (`model`, `backend`, `extraSkills`, `extraMcp`, `allow`, `permissionMode`) are refused before the network.
+
+`spawn`, `send`, `steer`, stopping one mission, stopping an agent or a project, and task creation share one sliding window. `TIMON_MCP_SPAWN_MAX` is how many of those calls are allowed (default 5). `TIMON_MCP_SPAWN_WINDOW_MS` is the window in milliseconds (default 3600000). Past the ceiling the tool result is `isError`, with the text `waiting for the operator's approval`, and the daemon is not called. Listing missions, reading a mission, reading one message, and interrupting a turn do not take a slot. The daemon token is a super-administrator, so this ceiling is the host's own quota.
+
+The mission tools are mounted by the host on `POST /mcp`, in front of the plugin's six tools. They need the same plugin bearer. They are absent when the plugin runs inside the daemon. `lib/` and the manifest are unchanged. The list and the detail are projections: the prompt, the transcript, the overrides, the owner, and the working directory are not returned. The message tool reads one event (`GET /api/missions/:id/messages/:eventId`) and returns at most 20,000 characters of its text.
+
+| Tool | Role |
+| --- | --- |
+| `list_all_missions` | Every mission. Optional `project`, `agent`, and `status` (`running`, `completed`, `failed`, `terminated`). No prompt. |
+| `get_mission_state` | State of one mission. No prompt. |
+| `get_mission_message` | One message of that mission, by `event_id`. The text is cut at 20,000 characters. |
+| `send_mission` | Follow-up on any mission. Counts against the window. |
+| `steer_mission` | Redirects the turn in progress. Counts against the window. |
+| `interrupt_mission` | Interrupts the turn. Does not count against the window. |
+| `stop_mission` | Stops one mission. Counts against the window. |
+| `stop_scope` | Stops one `agent` or one `project`, not both. Counts against the window. |
+| `launch_mission` | Starts `_main` or `<project>.<role>`. No override. Counts against the window. |
 
 In this mode `summary` is null. The mission route used here does not carry one.
 
