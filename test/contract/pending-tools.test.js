@@ -4,10 +4,12 @@ import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { BEARER_SECRET } from '../../lib/constants.js';
 import { PERMISSIONS_TOO_LARGE, RESPONSE_MAX_BYTES, createDaemonClient } from '../../host/daemon.js';
 import { PENDING_CARD_CAP } from '../../host/permissions.js';
+import { RESOLVED_ROW_CAP, createPendingWatcher } from '../../host/pending.js';
 import { startStandalone } from '../../host/standalone.js';
 import {
   WEBHOOK_ATTEMPTS,
@@ -21,6 +23,9 @@ const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
 const PLAN_ID = '22222222-2222-4222-8222-222222222222';
 const APPROVAL_ID = '33333333-3333-4333-8333-333333333333';
 const BROKEN_ID = '44444444-4444-4444-8444-444444444444';
+const EPH_ID = '66666666-6666-4666-8666-666666666666';
+const BAD_AGENT_ID = '77777777-7777-4777-8777-777777777777';
+const BAD_ID = 'not-a-uuid';
 
 test('the poll interval is bounded and a non-https webhook URL is refused', () => {
   assert.equal(readPendingInterval(undefined), 5000);
@@ -437,6 +442,142 @@ test('the poller does not treat an over-cap list as resolved', async (t) => {
   assert.equal(JSON.stringify(stack.logs).includes(secret), false);
   const stored = stack.host.ctx.sql.prepare('SELECT COUNT(*) AS n FROM host_pending_cards').get();
   assert.equal(Number(stored.n), 0);
+});
+
+test('an ephemeral agent is listed and notified, and a bad card is dropped by id', async (t) => {
+  const secret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  assert.notEqual(secret, hookSecret);
+  const receiver = await startReceiver(() => ({ status: 204 }));
+  t.after(() => receiver.close());
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+  stack.daemon.permissions.set(EPH_ID, {
+    id: EPH_ID,
+    mission_id: 'foreignmission01',
+    agent: '_eph-1a2b3c4d',
+    tool_name: 'bash',
+    tool_use_id: secret,
+    input: { command: `echo ${secret}`, token: secret },
+    shell_command: secret,
+    script_previews: [secret],
+    scopes: ['session'],
+    choices: [secret],
+    onPaste: secret,
+    created_at: 1000,
+    timeout_ms: 1000,
+  });
+  stack.daemon.permissions.set(BAD_AGENT_ID, {
+    id: BAD_AGENT_ID,
+    mission_id: 'foreignmission01',
+    agent: 'bad agent',
+    tool_name: 'bash',
+    input: { command: secret, token: secret },
+    shell_command: secret,
+    created_at: 2000,
+    timeout_ms: 1000,
+  });
+  stack.daemon.permissions.set(BAD_ID, {
+    id: BAD_ID,
+    mission_id: 'foreignmission01',
+    agent: '_eph-1a2b3c4d',
+    tool_name: 'bash',
+    input: { command: secret },
+    shell_command: secret,
+    created_at: 3000,
+    timeout_ms: 1000,
+  });
+
+  const listed = await call(stack, 'list_pending', {});
+  assert.equal(listed.body.result.isError, false);
+  const cards = listed.body.result.structuredContent.cards;
+  assert.deepEqual(cards.map((card) => card.id), [EPH_ID]);
+  assert.equal(cards[0].agent, '_eph-1a2b3c4d');
+  assert.equal(cards[0].type, 'approval');
+  assert.equal(listed.text.includes(secret), false);
+  assert.equal(listed.text.includes('bad agent'), false);
+  assert.equal(listed.text.includes(BAD_ID), false);
+
+  await stack.host.pollPending();
+  assert.equal(receiver.requests.length, 1);
+  const delivered = receiver.requests[0];
+  const payload = JSON.parse(delivered.body);
+  assert.equal(payload.event, 'pending');
+  assert.equal(payload.card.id, EPH_ID);
+  assert.equal(payload.card.agent, '_eph-1a2b3c4d');
+  assert.equal(delivered.body.includes(secret), false);
+  assert.equal(delivered.body.includes(hookSecret), false);
+  assert.equal(delivered.body.includes('"input"'), false);
+  assert.equal(delivered.body.includes('bad agent'), false);
+  assert.equal(delivered.body.includes(BAD_ID), false);
+  verifySignature(delivered, hookSecret);
+
+  const dropped = stack.logs
+    .map((row) => row.message)
+    .filter((message) => message.startsWith('pending card dropped'));
+  assert.ok(dropped.filter((message) => message === `pending card dropped id=${BAD_AGENT_ID}`).length >= 2);
+  assert.ok(dropped.filter((message) => message === `pending card dropped id=${BAD_ID}`).length >= 2);
+  for (const message of dropped) {
+    assert.equal(message.includes(secret), false);
+    assert.equal(message.includes(hookSecret), false);
+    assert.equal(message.includes('input'), false);
+  }
+  const stored = stack.host.ctx.sql.prepare('SELECT id FROM host_pending_cards').all();
+  assert.deepEqual(stored.map((row) => row.id), [EPH_ID]);
+});
+
+test('resolved rows stay bounded and a busy poll ignores the next tick', async () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`
+    CREATE TABLE host_pending_cards (
+      id TEXT PRIMARY KEY,
+      event TEXT NOT NULL CHECK (event IN ('pending', 'resolved')),
+      projection TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  const insert = db.prepare(
+    'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
+  );
+  for (let i = 0; i < RESOLVED_ROW_CAP + 5; i += 1) {
+    const id = `88888888-8888-4888-8888-${String(i).padStart(12, '0')}`;
+    insert.run(id, 'resolved', JSON.stringify({ id }), i);
+  }
+  let release;
+  let calls = 0;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const watcher = createPendingWatcher({
+    client: {
+      async request() {
+        calls += 1;
+        if (calls === 1) await gate;
+        return { status: 200, json: { pending: [] } };
+      },
+    },
+    sql: db,
+    webhook: null,
+    log() {},
+  });
+  const first = watcher.poll();
+  const second = watcher.poll();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(calls, 1);
+  release();
+  await first;
+  await second;
+  assert.equal(calls, 1);
+  const kept = db.prepare("SELECT COUNT(*) AS n FROM host_pending_cards WHERE event = 'resolved'").get();
+  assert.equal(Number(kept.n), RESOLVED_ROW_CAP);
+  const oldest = db.prepare("SELECT MIN(updated_at) AS n FROM host_pending_cards").get();
+  assert.equal(Number(oldest.n), 5);
+  await watcher.poll();
+  assert.equal(calls, 2);
+  db.close();
 });
 
 test('the poller fires on the configured interval', async (t) => {

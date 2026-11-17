@@ -117,6 +117,22 @@ export function isNamedAgent(value) {
 }
 
 /**
+ * An agent name the daemon will show on a card.
+ * Release 0.1.8 `validName` in `agent-config.js` is `/^[A-Za-z0-9._-]+$/`.
+ * This host keeps that shape and caps it at 80 characters. An ephemeral id
+ * (`_eph-…`) matches. This is not a name the host will place on a path:
+ * that stays `isNamedAgent`.
+ */
+export const DISPLAY_AGENT = /^[A-Za-z0-9._-]{1,80}$/;
+
+/**
+ * @param {unknown} value
+ */
+export function isDisplayAgent(value) {
+  return typeof value === 'string' && DISPLAY_AGENT.test(value);
+}
+
+/**
  * @param {unknown} value
  */
 export function isMissionId(value) {

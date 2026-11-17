@@ -12,7 +12,7 @@
  * (`permissions.js`): `ask_user` whose payload does not validate is not a
  * question.
  */
-import { isMissionId, isNamedAgent } from './names.js';
+import { isDisplayAgent, isMissionId } from './names.js';
 
 /** Cards the poller will diff. Above this, a missing tail must not look resolved. */
 export const PENDING_CARD_CAP = 200;
@@ -262,6 +262,7 @@ function timestamp(value) {
 
 /**
  * One card, or `null` when the id, mission, or agent cannot be shown.
+ * The agent is a display name (`isDisplayAgent`), not a path name.
  * The returned object is built field by field. Raw input is not copied.
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
@@ -270,7 +271,7 @@ export function projectCard(raw) {
   if (!isPlain(raw)) return null;
   if (typeof raw.id !== 'string' || !CARD_ID.test(raw.id)) return null;
   if (!isMissionId(raw.mission_id)) return null;
-  if (!isNamedAgent(raw.agent)) return null;
+  if (!isDisplayAgent(raw.agent)) return null;
   const created = timestamp(raw.created_at);
   if (created === null) return null;
   const timeout = timestamp(raw.timeout_ms);

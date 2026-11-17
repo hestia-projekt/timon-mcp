@@ -4,8 +4,14 @@
  *
  * Card ids are stored in the host sqlite database. A restart does not send
  * `pending` again for an id already recorded. With no webhook URL the poll
- * still records ids, and nothing is sent. `list_pending` reads the daemon
- * on demand and does not use that table.
+ * still records ids, and nothing is sent. A URL set later can still emit
+ * `resolved` for a recorded card that disappears. A card that was never
+ * recorded does not. `list_pending` reads the daemon on demand and does not
+ * use that table.
+ *
+ * A timer tick that arrives while a pass is running is ignored. Resolved
+ * rows are kept up to `RESOLVED_ROW_CAP`; the oldest are deleted past that.
+ * A card `projectCard` refuses is logged by id only, never by its body.
  */
 import { PERMISSIONS_TOO_LARGE } from './daemon.js';
 import {
@@ -21,6 +27,12 @@ import { deliverWebhook } from './webhook.js';
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 
+/** Resolved rows kept after a complete poll. Oldest go first past this. */
+export const RESOLVED_ROW_CAP = 200;
+
+/** A dropped id is logged alone, and not as a whole card. */
+const DROPPED_ID_MAX = 200;
+
 /**
  * @param {unknown} value
  * @returns {value is Record<string, unknown>}
@@ -35,6 +47,16 @@ function isPlain(value) {
 function createStore(sql) {
   const one = sql.prepare('SELECT id, event, projection FROM host_pending_cards WHERE id = ?');
   const open = sql.prepare("SELECT id, projection FROM host_pending_cards WHERE event = 'pending' ORDER BY id");
+  const countResolved = sql.prepare("SELECT COUNT(*) AS n FROM host_pending_cards WHERE event = 'resolved'");
+  const deleteOldestResolved = sql.prepare(`
+    DELETE FROM host_pending_cards
+    WHERE id IN (
+      SELECT id FROM host_pending_cards
+      WHERE event = 'resolved'
+      ORDER BY updated_at ASC, id ASC
+      LIMIT ?
+    )
+  `);
   const save = sql.prepare(`
     INSERT INTO host_pending_cards (id, event, projection, updated_at)
     VALUES (?, ?, ?, ?)
@@ -61,6 +83,12 @@ function createStore(sql) {
      */
     save(id, event, card, now) {
       save.run(id, event, JSON.stringify(card), now);
+    },
+    purgeResolved() {
+      const row = countResolved.get();
+      const extra = Number(row && row.n) - RESOLVED_ROW_CAP;
+      if (!Number.isFinite(extra) || extra <= 0) return;
+      deleteOldestResolved.run(extra);
     },
   };
 }
@@ -95,6 +123,21 @@ export function createPendingWatcher(options) {
   const now = options.now ?? Date.now;
   let chain = Promise.resolve();
   let stopped = false;
+  let busy = false;
+
+  /**
+   * `projectCard` refused this value. The id is logged when it is a string.
+   * The card body is not.
+   * @param {unknown} raw
+   */
+  function noteDropped(raw) {
+    if (!isPlain(raw) || typeof raw.id !== 'string') {
+      log('pending card dropped');
+      return;
+    }
+    const id = raw.id.replace(/[\u0000\r\n]/g, '').slice(0, DROPPED_ID_MAX);
+    log(`pending card dropped id=${id}`);
+  }
 
   /**
    * @returns {Promise<Record<string, unknown>[] | null>}
@@ -121,7 +164,11 @@ export function createPendingWatcher(options) {
     const cards = [];
     for (const raw of result.json.pending) {
       const card = projectCard(raw);
-      if (card) cards.push(card);
+      if (!card) {
+        noteDropped(raw);
+        continue;
+      }
+      cards.push(card);
     }
     cards.sort((a, b) => Number(a.created_at) - Number(b.created_at) || String(a.id).localeCompare(String(b.id)));
     return cards;
@@ -181,10 +228,19 @@ export function createPendingWatcher(options) {
       if (stopped) return;
       store.save(row.id, 'resolved', card, now());
     }
+    if (!stopped) store.purgeResolved();
   }
 
   function poll() {
-    const run = chain.then(() => once());
+    if (busy) return chain;
+    busy = true;
+    const run = chain.then(async () => {
+      try {
+        await once();
+      } finally {
+        busy = false;
+      }
+    });
     chain = run.then(() => {}, () => {});
     return run;
   }
@@ -223,7 +279,10 @@ export function createPendingWatcher(options) {
       const cards = [];
       for (const raw of result.json.pending) {
         const card = projectCard(raw);
-        if (!card) continue;
+        if (!card) {
+          noteDropped(raw);
+          continue;
+        }
         if (missionId && card.mission_id !== missionId) continue;
         cards.push(card);
       }
