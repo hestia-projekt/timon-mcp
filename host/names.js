@@ -27,6 +27,16 @@ export const LIST_STATUS = /^(?:running|completed|failed|terminated)$/;
 /** 1..100, no leading zero. */
 export const LIST_LIMIT = /^(?:[1-9][0-9]?|100)$/;
 
+/** Statuses `PUT /api/tasks/:id` accepts. `TODO` is the deprecated alias and is not sent. */
+export const TASK_STATUS_NAMES = Object.freeze(['PENDING', 'IN_PROGRESS', 'DONE', 'BLOCKED']);
+
+/** Types `POST /api/tasks` accepts on this release. */
+export const TASK_TYPE_NAMES = Object.freeze(['code', 'review', 'merge', 'research', 'doc', 'chore']);
+
+export const TASK_STATUS = new RegExp(`^(?:${TASK_STATUS_NAMES.join('|')})$`);
+
+export const TASK_TYPE = new RegExp(`^(?:${TASK_TYPE_NAMES.join('|')})$`);
+
 /**
  * Path words the daemon serves under `/api/missions/<word>` as their own
  * routes. They must not be sent as a mission id: `latest` and `search` are
@@ -60,4 +70,31 @@ export function isMissionId(value) {
  */
 export function isEventId(value) {
   return typeof value === 'string' && EVENT_ID.test(value);
+}
+
+/**
+ * @param {unknown} value
+ */
+export function isTaskStatus(value) {
+  return typeof value === 'string' && TASK_STATUS.test(value);
+}
+
+/**
+ * @param {unknown} value
+ */
+export function isTaskType(value) {
+  return typeof value === 'string' && TASK_TYPE.test(value);
+}
+
+/**
+ * A worktree base the daemon will accept (`isPlausibleGitRef` in release 0.1.8).
+ * Not an existence check. A leading `-` would be a git flag. `..` would be a path.
+ * @param {unknown} value
+ */
+export function isGitRef(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 255) return false;
+  if (value !== value.trim()) return false;
+  if (value.startsWith('-') || value.startsWith('/') || value.endsWith('/')) return false;
+  if (value.includes('..') || value.endsWith('.lock')) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(value);
 }

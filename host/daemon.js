@@ -17,6 +17,7 @@ import {
   NAMED_AGENT,
   PROJECT_NAME,
   RESERVED_MISSION_IDS,
+  TASK_STATUS,
 } from './names.js';
 
 /** Longest daemon body this client will parse. */
@@ -87,12 +88,34 @@ export const DAEMON_ROUTES = Object.freeze([
     name: 'tasks.add',
     method: 'POST',
     path: '/api/tasks',
-    body: Object.freeze(['title', 'description', 'agent_name', 'type', 'project']),
+    // Required keys, plus the optional ones. A missing required key is refused.
+    // `backend`, `model`, `permission`, `fallback`, and the extra-* lists are not here.
+    body: Object.freeze(['title', 'description', 'agent_name', 'type', 'project', 'priority', 'deps', 'base']),
+    bodyRequired: Object.freeze(['title', 'description', 'agent_name', 'type', 'project']),
   }),
   Object.freeze({
     name: 'tasks.get',
     method: 'GET',
     path: '/api/tasks/:id',
+  }),
+  Object.freeze({
+    name: 'tasks.list',
+    method: 'GET',
+    path: '/api/tasks',
+    // The daemon filters on `status` only. Project, agent, and type stay in the host.
+    query: Object.freeze(['status']),
+    queryStatus: TASK_STATUS,
+  }),
+  Object.freeze({
+    name: 'tasks.update',
+    method: 'PUT',
+    path: '/api/tasks/:id',
+    // Move, edit, and comment. `done_comment` is the comment field this route stores.
+    // There is no DELETE: `kanban:delete` is not a gesture of this host.
+    body: Object.freeze([
+      'title', 'description', 'agent_name', 'priority', 'deps', 'status', 'blocked_reason', 'done_comment',
+    ]),
+    bodyRequired: Object.freeze([]),
   }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
@@ -301,7 +324,7 @@ function queryString(route, method, path, query) {
   const params = new URLSearchParams();
   for (const key of allowed) {
     if (query[key] === undefined) continue;
-    if (!queryValueOk(key, query[key])) throw new DaemonRouteError(method, path);
+    if (!queryValueOk(route, key, query[key])) throw new DaemonRouteError(method, path);
     params.append(key, query[key]);
   }
   const text = params.toString();
@@ -309,20 +332,21 @@ function queryString(route, method, path, query) {
 }
 
 /**
+ * @param {{ queryStatus?: RegExp }} route
  * @param {string} key
  * @param {unknown} value
  */
-function queryValueOk(key, value) {
+function queryValueOk(route, key, value) {
   if (typeof value !== 'string' || value !== value.trim()) return false;
   if (key === 'project') return PROJECT_NAME.test(value);
   if (key === 'agent') return NAMED_AGENT.test(value);
-  if (key === 'status') return LIST_STATUS.test(value);
+  if (key === 'status') return (route.queryStatus ?? LIST_STATUS).test(value);
   if (key === 'limit') return LIST_LIMIT.test(value);
   return false;
 }
 
 /**
- * @param {{ body?: readonly string[] | string }} route
+ * @param {{ body?: readonly string[] | string, bodyRequired?: readonly string[] }} route
  * @param {string} method
  * @param {string} path
  * @param {unknown} body
@@ -339,6 +363,17 @@ function assertBody(route, method, path, body) {
   if (!isPlain(body) || !Array.isArray(route.body)) throw new DaemonRouteError(method, path);
   const allowed = new Set(route.body);
   const keys = Object.keys(body);
+  if (Array.isArray(route.bodyRequired)) {
+    // A subset. Every required key is present, and at least one key is sent.
+    if (keys.length === 0) throw new DaemonRouteError(method, path);
+    for (const key of keys) {
+      if (!allowed.has(key)) throw new DaemonRouteError(method, path);
+    }
+    for (const key of route.bodyRequired) {
+      if (!Object.prototype.hasOwnProperty.call(body, key)) throw new DaemonRouteError(method, path);
+    }
+    return;
+  }
   if (keys.length !== allowed.size) throw new DaemonRouteError(method, path);
   for (const key of keys) {
     if (!allowed.has(key)) throw new DaemonRouteError(method, path);

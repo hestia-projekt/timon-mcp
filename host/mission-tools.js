@@ -18,6 +18,7 @@ import {
 } from '../lib/mcp/jsonrpc.js';
 import { acceptsJson, foreignOrigin, header } from '../lib/mcp/origin.js';
 import { TOOLS, explainToolError, toolError, validateInput } from '../lib/mcp/tools.js';
+import { KANBAN_TOOLS } from './kanban-tools.js';
 import { MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
 const STATUS_ENUM = ['running', 'completed', 'failed', 'terminated'];
@@ -201,7 +202,8 @@ export const MISSION_TOOLS = [
   },
 ];
 
-const HOST_BY_NAME = new Map(MISSION_TOOLS.map((tool) => [tool.name, tool]));
+const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS);
+const HOST_BY_NAME = new Map(HOST_TOOLS.map((tool) => [tool.name, tool]));
 
 /**
  * @param {{ all: Function }} router
@@ -285,7 +287,7 @@ function publicTools() {
     description: tool.description,
     inputSchema: tool.inputSchema,
   }));
-  const host = MISSION_TOOLS.map((tool) => ({
+  const host = HOST_TOOLS.map((tool) => ({
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,

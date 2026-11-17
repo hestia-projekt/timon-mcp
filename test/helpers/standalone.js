@@ -33,6 +33,7 @@ export async function openStack(t, options = {}) {
       token,
       echoToken: options.echoToken === true,
       foreignId: options.foreignId,
+      foreignTaskId: options.foreignTaskId,
     });
   }
   const daemonUrl = daemon ? daemon.origin : (options.daemonUrl || 'http://127.0.0.1:9');

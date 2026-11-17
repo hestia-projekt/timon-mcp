@@ -14,11 +14,26 @@ import {
   PluginPolicyError,
   PluginTaskError,
 } from './errors.js';
-import { isMissionId, isNamedAgent, isProject } from './names.js';
+import {
+  isGitRef,
+  isMissionId,
+  isNamedAgent,
+  isProject,
+  isTaskStatus,
+  isTaskType,
+} from './names.js';
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
 const LIST_STATUS = new Set(['running', 'completed', 'failed', 'terminated']);
 const LIST_FILTERS = new Set(['project', 'agent', 'status', 'limit']);
+const TASK_LIST_FILTERS = new Set(['project', 'agent', 'status', 'type', 'limit']);
+const OPEN_TASK_KEYS = new Set(['project', 'title', 'description', 'agent', 'type', 'base', 'deps', 'priority']);
+const UPDATE_TASK_KEYS = new Set(['title', 'description', 'priority', 'deps', 'agent']);
+const MOVE_TASK_KEYS = new Set(['status', 'reason', 'comment']);
+/** Same bound as the plugin facade's dependency list. */
+const DEPS_MAX = 200;
+const PRIORITY_MIN = -1000;
+const PRIORITY_MAX = 1000;
 /** Ids fetched per list. Both statements apply this bound in SQL. */
 const LIST_GET_MAX = 50;
 /**
@@ -408,6 +423,102 @@ export function createTaskFacade(deps) {
       insert.run(id, body.project, body.agent_name, body.title, Date.now());
       return { ...picked, id };
     },
+
+    /**
+     * Every task on the install. The daemon is asked for `status` only.
+     * Project, agent, and type are applied here. Overrides and paths are dropped.
+     * @param {Record<string, unknown>} [opts]
+     */
+    async listAll(opts = {}) {
+      const filter = taskListFilter(opts);
+      const query = filter.status ? { status: filter.status } : undefined;
+      const result = await callTask(() => client.request('GET', '/api/tasks', undefined, query));
+      if (result.status !== 200 || !isPlain(result.json)) throw taskHttpError(result.status, result.json);
+      const rows = /** @type {{ tasks?: unknown }} */ (result.json).tasks;
+      if (!Array.isArray(rows)) throw new PluginTaskError('invalid', 'daemon response was refused');
+      /** @type {Record<string, unknown>[]} */
+      const out = [];
+      for (const row of rows) {
+        if (!isPlain(row)) continue;
+        if (filter.project && row.project !== filter.project) continue;
+        if (filter.agent && row.agent_name !== filter.agent) continue;
+        if (filter.status && row.status !== filter.status) continue;
+        if (filter.type && row.type !== filter.type) continue;
+        out.push(projectTaskList(row));
+        if (out.length >= filter.limit) break;
+      }
+      return out;
+    },
+
+    /**
+     * One task, whether or not this host created it. A 404 is "not there".
+     * @param {unknown} taskId
+     */
+    async read(taskId) {
+      const id = requireTaskId(taskId);
+      const result = await callTask(() => client.request('GET', `/api/tasks/${id}`));
+      return taskFromResult(id, result, 200);
+    },
+
+    /**
+     * A task of any of the six types, on an agent that already exists.
+     * The body is a whitelist. Counts against the spawn window: the dispatcher
+     * will run it. The chore tool keeps using `add`.
+     * @param {unknown} input
+     */
+    async create(input) {
+      const body = openTaskBody(input);
+      takeSpawn(quota);
+      const result = await callTask(() => client.request('POST', '/api/tasks', body));
+      const task = result.status === 201 ? taskRecord(result) : null;
+      if (!task) throw taskHttpError(result.status, result.json);
+      const picked = projectTaskDetail(task);
+      const id = safeId(picked.id);
+      if (!id) throw new PluginTaskError('invalid', 'daemon response was refused');
+      insert.run(id, body.project, body.agent_name, body.title, Date.now());
+      return { ...picked, id };
+    },
+
+    /**
+     * Title, description, priority, dependencies, or agent. Not the status.
+     * Does not take a quota slot.
+     * @param {unknown} taskId
+     * @param {unknown} input
+     */
+    async update(taskId, input) {
+      const id = requireTaskId(taskId);
+      const body = updateTaskBody(input);
+      const result = await callTask(() => client.request('PUT', `/api/tasks/${id}`, body));
+      return taskFromResult(id, result, 200);
+    },
+
+    /**
+     * Status change. `BLOCKED` requires a reason (`blocked_reason`).
+     * `comment` is sent as `done_comment` in the same body: release 0.1.8
+     * stores that field when the status changes. Does not take a quota slot.
+     * @param {unknown} taskId
+     * @param {unknown} input
+     */
+    async move(taskId, input) {
+      const id = requireTaskId(taskId);
+      const body = moveTaskBody(input);
+      const result = await callTask(() => client.request('PUT', `/api/tasks/${id}`, body));
+      return taskFromResult(id, result, 200);
+    },
+
+    /**
+     * `done_comment`, the comment field `PUT /api/tasks/:id` accepts.
+     * Release 0.1.8 applies it when the same request also changes the status.
+     * A comment alone still sends nothing else. Does not take a quota slot.
+     * @param {unknown} taskId
+     * @param {unknown} text
+     */
+    async comment(taskId, text) {
+      const id = requireTaskId(taskId);
+      const comment = commentText(text);
+      const result = await callTask(() => client.request('PUT', `/api/tasks/${id}`, { done_comment: comment }));
+      return taskFromResult(id, result, 200);
+    },
   };
 }
 
@@ -476,6 +587,266 @@ function taskBody(input) {
 }
 
 /**
+ * The six types. Optional `priority`, `deps`, and `base` are sent only when set.
+ * @param {unknown} input
+ */
+function openTaskBody(input) {
+  const record = plainRecord(input, () => new PluginTaskError('invalid', 'task is required'));
+  refuseTaskKeys(record, OPEN_TASK_KEYS);
+  const project = record.project;
+  const title = record.title;
+  const agent = record.agent;
+  const type = record.type;
+  const description = record.description;
+  if (!isProject(project)) throw new PluginTaskError('invalid', 'project is invalid');
+  if (!isTaskType(type)) throw new PluginTaskError('invalid', 'type is invalid');
+  if (!isNamedAgent(agent)) throw new PluginTaskError('invalid', 'agent is invalid');
+  if (typeof title !== 'string' || !title.trim() || title.length > 500) {
+    throw new PluginTaskError('invalid', 'title is required');
+  }
+  if (description !== undefined && (typeof description !== 'string' || description.length > MESSAGE_MAX_CHARS)) {
+    throw new PluginTaskError('invalid', 'description is invalid');
+  }
+  /** @type {Record<string, unknown>} */
+  const body = {
+    title,
+    description: typeof description === 'string' ? description : '',
+    agent_name: agent,
+    type,
+    project,
+  };
+  if (record.priority !== undefined) body.priority = requirePriority(record.priority);
+  if (record.deps !== undefined) body.deps = requireDeps(record.deps);
+  if (record.base !== undefined) {
+    if (!isGitRef(record.base)) throw new PluginTaskError('invalid', 'base is invalid');
+    body.base = record.base;
+  }
+  return body;
+}
+
+/**
+ * @param {unknown} input
+ */
+function updateTaskBody(input) {
+  const record = plainRecord(input, () => new PluginTaskError('invalid', 'task is required'));
+  refuseTaskKeys(record, UPDATE_TASK_KEYS);
+  /** @type {Record<string, unknown>} */
+  const body = {};
+  if (record.title !== undefined) {
+    if (typeof record.title !== 'string' || !record.title.trim() || record.title.length > 500) {
+      throw new PluginTaskError('invalid', 'title is required');
+    }
+    body.title = record.title;
+  }
+  if (record.description !== undefined) {
+    if (typeof record.description !== 'string' || record.description.length > MESSAGE_MAX_CHARS) {
+      throw new PluginTaskError('invalid', 'description is invalid');
+    }
+    body.description = record.description;
+  }
+  if (record.priority !== undefined) body.priority = requirePriority(record.priority);
+  if (record.deps !== undefined) body.deps = requireDeps(record.deps);
+  if (record.agent !== undefined) {
+    if (!isNamedAgent(record.agent)) throw new PluginTaskError('invalid', 'agent is invalid');
+    body.agent_name = record.agent;
+  }
+  if (Object.keys(body).length === 0) throw new PluginTaskError('invalid', 'task update is empty');
+  return body;
+}
+
+/**
+ * @param {unknown} input
+ */
+function moveTaskBody(input) {
+  const record = plainRecord(input, () => new PluginTaskError('invalid', 'task is required'));
+  refuseTaskKeys(record, MOVE_TASK_KEYS);
+  if (!isTaskStatus(record.status)) throw new PluginTaskError('invalid', 'status is invalid');
+  /** @type {Record<string, unknown>} */
+  const body = { status: record.status };
+  if (record.status === 'BLOCKED') {
+    if (!commentTextOk(record.reason)) {
+      throw new PluginTaskError('invalid', 'reason is required to mark a task as blocked');
+    }
+    body.blocked_reason = record.reason;
+  } else if (record.reason !== undefined) {
+    throw new PluginTaskError('invalid', 'reason is only accepted when status is BLOCKED');
+  }
+  if (record.comment !== undefined) {
+    body.done_comment = commentText(record.comment);
+  }
+  return body;
+}
+
+/**
+ * @param {unknown} text
+ */
+function commentText(text) {
+  if (!commentTextOk(text)) throw new PluginTaskError('invalid', 'comment is required');
+  return text;
+}
+
+/**
+ * @param {unknown} text
+ */
+function commentTextOk(text) {
+  return typeof text === 'string' && Boolean(text.trim()) && text.length <= MESSAGE_MAX_CHARS;
+}
+
+/**
+ * @param {unknown} value
+ */
+function requirePriority(value) {
+  if (!Number.isInteger(value) || value < PRIORITY_MIN || value > PRIORITY_MAX) {
+    throw new PluginTaskError('invalid', 'priority is invalid');
+  }
+  return value;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function requireDeps(value) {
+  if (!Array.isArray(value) || value.length > DEPS_MAX) {
+    throw new PluginTaskError('invalid', 'deps is invalid');
+  }
+  for (const item of value) {
+    if (!isMissionId(item)) throw new PluginTaskError('invalid', 'deps is invalid');
+  }
+  return value.slice();
+}
+
+/**
+ * @param {Record<string, unknown>} record
+ * @param {Set<string>} allowed
+ */
+function refuseTaskKeys(record, allowed) {
+  refuseKeys(record, allowed, (key) => {
+    if (overrideKey(key)) throw new PluginTaskError('forbidden', 'override is not allowed');
+    throw new PluginTaskError('invalid', 'unexpected field');
+  });
+}
+
+/**
+ * @param {unknown} id
+ * @returns {string}
+ */
+function requireTaskId(id) {
+  if (!isMissionId(id)) throw new PluginTaskError('invalid', 'task id is invalid');
+  return id;
+}
+
+/**
+ * @param {Record<string, unknown>} opts
+ */
+function taskListFilter(opts) {
+  const record = isPlain(opts) ? opts : {};
+  refuseTaskKeys(record, TASK_LIST_FILTERS);
+  /** @type {{ limit: number, project?: string, agent?: string, status?: string, type?: string }} */
+  const filter = {
+    limit: boundedLimit(record.limit, 50, () => new PluginTaskError('invalid', 'limit is invalid')),
+  };
+  if (record.project !== undefined) {
+    if (!isProject(record.project)) throw new PluginTaskError('invalid', 'project is invalid');
+    filter.project = record.project;
+  }
+  if (record.agent !== undefined) {
+    if (!isNamedAgent(record.agent)) throw new PluginTaskError('invalid', 'agent is invalid');
+    filter.agent = record.agent;
+  }
+  if (record.status !== undefined) {
+    if (!isTaskStatus(record.status)) throw new PluginTaskError('invalid', 'status is invalid');
+    filter.status = record.status;
+  }
+  if (record.type !== undefined) {
+    if (!isTaskType(record.type)) throw new PluginTaskError('invalid', 'type is invalid');
+    filter.type = record.type;
+  }
+  return filter;
+}
+
+/**
+ * @param {string} id
+ * @param {{ status: number, json: unknown }} result
+ * @param {number} okStatus
+ */
+function taskFromResult(id, result, okStatus) {
+  if (result.status === 404) throw new PluginTaskError('not_found', 'Task not found.');
+  const task = result.status === okStatus ? taskRecord(result) : null;
+  if (!task) throw taskHttpError(result.status, result.json);
+  const picked = projectTaskDetail(task);
+  if (picked.id !== id) throw new PluginTaskError('invalid', 'daemon response was refused');
+  return picked;
+}
+
+/**
+ * List row. Description, comment, overrides, and paths stay out.
+ * @param {Record<string, unknown>} task
+ */
+function projectTaskList(task) {
+  return {
+    id: asString(task.id),
+    title: asString(task.title),
+    status: asString(task.status),
+    agent_name: asString(task.agent_name),
+    project: asString(task.project),
+    type: asString(task.type),
+    priority: Number.isInteger(task.priority) ? task.priority : null,
+    deps: asDeps(task.deps),
+    created_at: asStamp(task.created_at),
+    updated_at: asStamp(task.updated_at),
+  };
+}
+
+/**
+ * Detail. `done_comment` is the comment column. `base` is `base_branch`.
+ * @param {Record<string, unknown>} task
+ */
+function projectTaskDetail(task) {
+  /** @type {{ hit: boolean }} */
+  const flag = { hit: false };
+  return {
+    ...projectTaskList(task),
+    description: takeText(task.description, '', flag),
+    base: asString(typeof task.base_branch === 'string' ? task.base_branch : task.base),
+    blocked_reason: takeText(task.blocked_reason, null, flag),
+    done_comment: takeText(task.done_comment, null, flag),
+    truncated: flag.hit,
+  };
+}
+
+/**
+ * The column is a JSON array, sometimes already parsed.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function asDeps(value) {
+  let list = value;
+  if (typeof value === 'string') {
+    try {
+      list = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  return list.filter((item) => typeof item === 'string').slice(0, DEPS_MAX);
+}
+
+/**
+ * @param {unknown} value
+ * @param {string | null} empty
+ * @param {{ hit: boolean }} flag
+ * @returns {string | null}
+ */
+function takeText(value, empty, flag) {
+  if (typeof value !== 'string') return empty;
+  const bounded = boundText(value);
+  if (bounded.truncated) flag.hit = true;
+  return bounded.text;
+}
+
+/**
  * @param {unknown} text
  */
 function assertSendText(text) {
@@ -500,7 +871,11 @@ async function deliverSend(client, id, text) {
  * @param {string} key
  */
 function overrideKey(key) {
-  return OVERRIDE_EXACT.has(key) || key.includes('override') || key.includes('Override');
+  const lower = key.toLowerCase();
+  return OVERRIDE_EXACT.has(key)
+    || key.includes('override')
+    || key.includes('Override')
+    || lower.includes('fallback');
 }
 
 /**
