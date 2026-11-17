@@ -48,8 +48,22 @@ const FORBIDDEN = [
   ['PATCH', '/api/tasks/abc'],
   ['POST', '/api/tasks/abc/worktree'],
   ['GET', '/api/tasks/abc/attachments'],
-  ['GET', '/api/agents'],
   ['POST', '/api/agents/spawn'],
+  ['POST', '/api/projects'],
+  ['DELETE', '/api/projects/alpha'],
+  ['GET', '/api/projects/activity'],
+  ['POST', '/api/agents'],
+  ['GET', '/api/agents/active'],
+  ['DELETE', '/api/agents/_main'],
+  ['GET', '/api/agents/_main/skills'],
+  ['GET', '/api/agents/_main/files'],
+  ['PUT', '/api/agents/_main/files'],
+  ['PATCH', '/api/agents/alpha.coder/config'],
+  ['GET', '/api/messages'],
+  ['POST', '/api/messages/abc/pick'],
+  ['GET', '/api/agents/ab%2fcd'],
+  ['GET', '/api/agents/../projects'],
+  ['GET', '/api/projects?x=1'],
   ['POST', '/api/missions/delegate'],
   ['POST', '/api/admin'],
   ['GET', '/api/mcp-servers'],
@@ -78,7 +92,7 @@ test('the daemon client refuses every route outside the closed list', async (t) 
     rmSync(dir, { recursive: true, force: true });
   });
 
-  assert.equal(DAEMON_ROUTES.length, 13);
+  assert.equal(DAEMON_ROUTES.length, 17);
   for (const [method, path] of FORBIDDEN) {
     await assert.rejects(() => client.request(method, path), (err) => {
       assert.equal(err.code, 'route_denied');

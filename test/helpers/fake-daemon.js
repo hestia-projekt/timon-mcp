@@ -4,6 +4,7 @@
  */
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { DIRECT_FROM_AGENT, DIRECT_FROM_MISSION } from '../../host/names.js';
 
 /**
  * @param {object} [options]
@@ -21,6 +22,12 @@ export async function startFakeDaemon(options) {
   const missions = new Map();
   /** @type {Map<string, Record<string, unknown>>} */
   const tasks = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const projects = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const agents = new Map();
+  /** @type {Record<string, unknown>[]} */
+  const messages = [];
   /** @type {{ status: number, body?: unknown, redirect?: boolean } | null} */
   let failNext = null;
   /** @type {unknown} */
@@ -29,6 +36,11 @@ export async function startFakeDaemon(options) {
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
   }
+  projects.set('alpha', projectRow('alpha', { name: 'Alpha', status: 'active' }));
+  projects.set('beta', projectRow('beta', { name: 'Beta', status: 'paused' }));
+  projects.set('/secret/skip', projectRow('/secret/skip', { name: 'Nope', status: 'active' }));
+  for (const agent of seededAgents()) agents.set(String(agent.name), agent);
+
   if (options.foreignTaskId) {
     tasks.set(options.foreignTaskId, taskRow(options.foreignTaskId, {
       title: 'Foreign task',
@@ -264,6 +276,74 @@ export async function startFakeDaemon(options) {
       send(res, 200, { task });
       return;
     }
+    if (method === 'GET' && url.pathname === '/api/projects') {
+      send(res, 200, {
+        projects: [...projects.values()],
+        workspaces: ['desk', '/secret/workspace'],
+      });
+      return;
+    }
+    if (method === 'GET' && url.pathname === '/api/agents') {
+      send(res, 200, {
+        main_seat: { holder: '_main', empty: false, candidates: ['_main'], cwd: '/secret/seat' },
+        agents: [...agents.values()].map((agent) => ({ ...agent, main: agent.name === '_main' })),
+      });
+      return;
+    }
+    const oneAgent = url.pathname.match(/^\/api\/agents\/([^/]+)$/);
+    if (method === 'GET' && oneAgent) {
+      const agent = agents.get(oneAgent[1]);
+      if (!agent) {
+        send(res, 404, { error: 'agent not found', code: 'agent_not_found' });
+        return;
+      }
+      // `GET /api/agents/:name` in release 0.1.8 returns the agent, including
+      // the system prompt, then adds the effective orchestration.
+      send(res, 200, {
+        ...agent,
+        system_prompt: 'SECRET SYSTEM PROMPT',
+        effective_orchestrates: ['alpha.coder'],
+        orchestrates_source: 'flag',
+      });
+      return;
+    }
+    if (method === 'POST' && url.pathname === '/api/messages') {
+      const body = parseBody(bodyText);
+      if (typeof body.to_agent !== 'string' || body.payload === undefined) {
+        send(res, 400, { error: 'to_agent and payload required' });
+        return;
+      }
+      if (typeof body.from_mission !== 'string' || !body.from_mission || typeof body.from_agent !== 'string' || !body.from_agent) {
+        send(res, 400, { error: 'from_mission/from_agent required (header X-TIMON-Mission or body)' });
+        return;
+      }
+      if (!agents.has(body.to_agent)) {
+        send(res, 404, { error: `unknown agent: ${body.to_agent}` });
+        return;
+      }
+      const knownMission = body.from_mission === DIRECT_FROM_MISSION || missions.has(body.from_mission);
+      if (!knownMission) {
+        send(res, 400, { error: `unknown mission: ${body.from_mission}` });
+        return;
+      }
+      if (body.from_agent !== DIRECT_FROM_AGENT && body.from_mission === DIRECT_FROM_MISSION) {
+        // The system mission's stored sender is the host identity. Another
+        // from_agent is accepted when the mission exists, matching the route,
+        // which does not check the sender name against a directory.
+      }
+      const row = {
+        message_id: randomUUID(),
+        created_at: Date.now(),
+        to_agent: body.to_agent,
+        from_mission: body.from_mission,
+        from_agent: body.from_agent,
+        kind: typeof body.kind === 'string' ? body.kind : 'msg',
+        payload: body.payload,
+      };
+      messages.push(row);
+      send(res, 201, { message_id: row.message_id, created_at: row.created_at });
+      return;
+    }
     send(res, 500, { error: 'unexpected route' });
   });
 
@@ -282,6 +362,9 @@ export async function startFakeDaemon(options) {
     requests,
     missions,
     tasks,
+    projects,
+    agents,
+    messages,
     /**
      * @param {{ status: number, body?: unknown, redirect?: boolean }} next
      */
@@ -298,6 +381,110 @@ export async function startFakeDaemon(options) {
         if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       });
     },
+  };
+}
+
+/**
+ * A task row plus the fields the host must not return.
+ * @param {string} id
+ * @param {Record<string, unknown>} fields
+ */
+/**
+ * A project row as `GET /api/projects` builds it from `readMeta`, plus `cwd`.
+ * @param {string} slug
+ * @param {{ name: string, status: string }} fields
+ */
+function projectRow(slug, fields) {
+  return {
+    slug,
+    name: fields.name,
+    color: '#112233',
+    icon: '/api/uploads/project.png',
+    workspace: 'desk',
+    cwd: `/secret/${slug}`,
+    speech: 'SECRET SPEECH',
+    kind: 'code',
+    status: fields.status,
+    last_activity: 10,
+    grepai_watch: true,
+  };
+}
+
+/**
+ * Agents the list and the detail routes return in release 0.1.8.
+ * The list has no system-prompt text. The detail handler adds it.
+ * Names that are not `_main` or `<project>.<role>` are here so a projection
+ * that copies every row would leak them.
+ */
+function seededAgents() {
+  return [
+    agentRow('_main', { role: 'orchestrator', project: null, orchestrator: true, reports_to: null }),
+    agentRow('alpha.coder', {
+      role: 'coder',
+      project: 'alpha',
+      orchestrator: false,
+      reports_to: 'alpha.orchestrator',
+    }),
+    agentRow('alpha.orchestrator', {
+      role: 'orchestrator',
+      project: 'alpha',
+      orchestrator: true,
+      reports_to: '_main',
+    }),
+    agentRow('beta.reviewer', {
+      role: 'reviewer',
+      project: '/secret/beta',
+      orchestrator: false,
+      reports_to: '/secret/lead',
+    }),
+    agentRow('not-named', {
+      role: 'coder',
+      project: 'alpha',
+      orchestrator: false,
+      reports_to: null,
+      system_prompt: 'LEAKED NAME PROMPT',
+    }),
+  ];
+}
+
+/**
+ * @param {string} name
+ * @param {{ role: string, project: string | null, orchestrator: boolean, reports_to: string | null, system_prompt?: string }} fields
+ */
+function agentRow(name, fields) {
+  return {
+    name,
+    backend: 'hidden-backend',
+    cwd: `/secret/${name}`,
+    browser_profile_id: 'secret-profile',
+    model: 'hidden-model',
+    permission_mode: 'bypass',
+    allowed_tools: ['secret_tool'],
+    disallowed_tools: ['secret_denied'],
+    skills: ['secret-skill'],
+    mcp_servers: [{ command: '/secret/mcp', env: { TOKEN: 'SECRET TOKEN' } }],
+    excluded_mcp_servers: ['secret-mcp'],
+    has_system_prompt: true,
+    reports_to: fields.reports_to,
+    team: 'secret-team',
+    project: fields.project,
+    memory_scope: 'NONE',
+    ephemeral: false,
+    orchestrator: fields.orchestrator,
+    orchestrates: ['alpha.coder'],
+    global_context: false,
+    emoji: null,
+    color: '#abcdef',
+    icon_url: '/api/uploads/icon.png',
+    look: { src: '/secret/look' },
+    avatar: null,
+    role: fields.role,
+    role_emoji: null,
+    directives: 'SECRET DIRECTIVE',
+    reasoning_effort: 'high',
+    created_by: 'plugin:other',
+    api_key: 'SECRET KEY',
+    ...(fields.system_prompt ? { system_prompt: fields.system_prompt } : {}),
   };
 }
 

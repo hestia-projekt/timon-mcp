@@ -18,6 +18,7 @@ import {
 } from '../lib/mcp/jsonrpc.js';
 import { acceptsJson, foreignOrigin, header } from '../lib/mcp/origin.js';
 import { TOOLS, explainToolError, toolError, validateInput } from '../lib/mcp/tools.js';
+import { ROSTER_TOOLS } from './agent-tools.js';
 import { KANBAN_TOOLS } from './kanban-tools.js';
 import { MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
@@ -202,7 +203,7 @@ export const MISSION_TOOLS = [
   },
 ];
 
-const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS);
+const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS, ROSTER_TOOLS);
 const HOST_BY_NAME = new Map(HOST_TOOLS.map((tool) => [tool.name, tool]));
 
 /**
