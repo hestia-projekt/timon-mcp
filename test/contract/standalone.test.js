@@ -42,7 +42,12 @@ const FORBIDDEN = [
   ['GET', '/api/missions?limit=1'],
   ['PUT', '/api/stop'],
   ['GET', '/api/stop'],
-  ['GET', '/api/permissions'],
+  ['POST', '/api/permissions'],
+  ['PUT', '/api/permissions'],
+  ['DELETE', '/api/permissions'],
+  ['POST', '/api/permissions/request'],
+  ['POST', '/api/permissions/abc/resolve'],
+  ['GET', '/api/permissions?mission_id=abc'],
   ['POST', '/api/tasks/close'],
   ['PUT', '/api/tasks'],
   ['PATCH', '/api/tasks/abc'],
@@ -109,7 +114,7 @@ test('the daemon client refuses every route outside the closed list', async (t) 
     rmSync(dir, { recursive: true, force: true });
   });
 
-  assert.equal(DAEMON_ROUTES.length, 27);
+  assert.equal(DAEMON_ROUTES.length, 28);
   for (const [method, path] of FORBIDDEN) {
     await assert.rejects(() => client.request(method, path), (err) => {
       assert.equal(err.code, 'route_denied');
@@ -936,7 +941,7 @@ test('migrations apply once and the state file reopens', async (t) => {
   const names = stack.host.ctx.sql.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table'",
   ).all().map((row) => row.name);
-  for (const name of ['oauth_clients', 'host_missions', 'host_tasks', 'schema_migrations']) {
+  for (const name of ['oauth_clients', 'host_missions', 'host_tasks', 'host_pending_cards', 'schema_migrations']) {
     assert.ok(names.includes(name), name);
   }
   const pragma = stack.host.ctx.sql.prepare('PRAGMA busy_timeout').get();
@@ -950,12 +955,13 @@ test('migrations apply once and the state file reopens', async (t) => {
     env: { [BEARER_SECRET]: stack.bearer },
     journal: [],
     logs: [],
+    pendingPoll: false,
   });
   t.after(() => again.close());
   const count = again.ctx.sql.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get();
-  assert.equal(Number(count.n), 2);
+  assert.equal(Number(count.n), 3);
   const applied = again.ctx.sql.prepare('SELECT name FROM schema_migrations ORDER BY name').all().map((row) => row.name);
-  assert.deepEqual(applied, ['001-oauth.sql', '002-list-index.sql']);
+  assert.deepEqual(applied, ['001-oauth.sql', '002-list-index.sql', '003-pending-cards.sql']);
   const indexes = again.ctx.sql.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('host_missions', 'host_tasks')",
   ).all().map((row) => row.name);

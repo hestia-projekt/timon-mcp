@@ -11,11 +11,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { BEARER_SECRET, PLUGIN_ID, WAIT_MAX_S } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
-import { createDaemonClient, resolveDaemonOrigin } from './daemon.js';
+import { createDaemonClient, resolveDaemonOrigin, scrubValue } from './daemon.js';
 import { createAutomationFacade } from './automation.js';
 import { createMissionFacade, createRosterFacade, createSpawnQuota, createTaskFacade } from './facades.js';
 import { mountMissionTools } from './mission-tools.js';
+import { createPendingWatcher } from './pending.js';
 import { createResponse, createRouter } from './router.js';
+import { readPendingInterval, resolveWebhookConfig } from './webhook.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HOST_MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
@@ -85,9 +87,13 @@ const SETTING_KEYS = [
  * @param {Array<{ level: string, message: string }>} [options.logs]
  * @param {() => number} [options.now] Clock for the spawn quota. Tests inject it.
  * @param {boolean} [options.recordReads] When true, `ctx.sql` keeps the last 64 `.all()` row counts. Off in production.
+ * @param {boolean} [options.pendingPoll] When false, the permissions poller does not start. A call to `pollPending` still runs one pass. Default true.
+ * @param {(ms: number) => Promise<void>} [options.sleep] Wait used between webhook retries. Tests pass a function that does not delay.
  */
 export async function startStandalone(options = {}) {
   const env = options.env ?? process.env;
+  const pendingIntervalMs = readPendingInterval(env.TIMON_MCP_PENDING_INTERVAL_MS);
+  const webhook = resolveWebhookConfig(env);
   const trustProxy = env.TIMON_MCP_TRUST_PROXY === '1';
   const quota = createSpawnQuota(env, typeof options.now === 'function' ? options.now : Date.now);
   const origin = daemonOrigin(options, env);
@@ -110,6 +116,8 @@ export async function startStandalone(options = {}) {
   });
   const sql = createSql(db, options.recordReads === true);
   const disposers = [];
+  /** @type {ReturnType<typeof createPendingWatcher> | null} */
+  let pending = null;
   /** @type {ReturnType<typeof createRouter>[]} */
   const routers = [];
   const buckets = new Map();
@@ -132,6 +140,15 @@ export async function startStandalone(options = {}) {
     kanban: createTaskFacade({ client, sql, quota }),
     roster: createRosterFacade({ client, quota }),
     automation: createAutomationFacade({ client, quota }),
+    pending: {
+      /**
+       * @param {object} [args]
+       */
+      list(args) {
+        if (!pending) throw new Error('pending list is not ready');
+        return pending.list(args);
+      },
+    },
     events: {
       /**
        * @param {unknown} kind
@@ -175,6 +192,20 @@ export async function startStandalone(options = {}) {
       error(...args) { pushLog(logs, 'error', args, client.scrub); },
     },
   };
+
+  pending = createPendingWatcher({
+    client,
+    sql,
+    webhook,
+    sleep: options.sleep,
+    now: typeof options.now === 'function' ? options.now : Date.now,
+    log(message) {
+      const needles = webhook ? [webhook.secret] : [];
+      const scrubbed = client.scrub(scrubValue(message, needles));
+      ctx.log.warn(typeof scrubbed === 'string' ? scrubbed : 'pending');
+    },
+  });
+  disposers.push(() => pending.stop());
 
   const server = createServer((incoming, raw) => {
     installResponseGuard(raw);
@@ -229,10 +260,11 @@ export async function startStandalone(options = {}) {
     for (const dispose of disposers.splice(0)) {
       try { dispose(); } catch { /* already stopped */ }
     }
-    return new Promise((resolve) => {
+    const idle = pending ? pending.idle() : Promise.resolve();
+    return idle.then(() => new Promise((resolve) => {
       server.close(() => resolve());
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-    }).then(() => {
+    })).then(() => {
       try { db.close(); } catch { /* already closed */ }
     });
   }
@@ -247,6 +279,12 @@ export async function startStandalone(options = {}) {
     pushLog(logs, 'error', ['http server error'], client.scrub);
   });
 
+  if (options.pendingPoll !== false) {
+    const timer = setInterval(() => { pending.poll(); }, pendingIntervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    disposers.push(() => clearInterval(timer));
+  }
+
   const bound = server.address();
   const actualPort = bound && typeof bound === 'object' ? bound.port : port;
   return {
@@ -257,6 +295,8 @@ export async function startStandalone(options = {}) {
     logs,
     ctx,
     journal,
+    pendingIntervalMs,
+    pollPending() { return pending.poll(); },
     bodyBytesRetained() { return retained.bytes; },
     socketTimeoutMs: server.timeout,
   };

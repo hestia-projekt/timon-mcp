@@ -51,6 +51,8 @@ export async function openStack(t, options = {}) {
       journal,
       logs,
       now: options.now,
+      sleep: options.sleep,
+      pendingPoll: options.pendingPoll === true,
       recordReads: options.recordReads === true,
     });
   } catch (err) {

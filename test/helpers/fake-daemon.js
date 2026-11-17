@@ -46,6 +46,10 @@ export async function startFakeDaemon(options) {
   const workflowRuns = new Map();
   /** @type {Map<string, Record<string, unknown>>} */
   const routines = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const permissions = new Map();
+  /** @type {string | null} */
+  let permissionsRaw = null;
 
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
@@ -363,6 +367,16 @@ export async function startFakeDaemon(options) {
       send(res, 201, { message_id: row.message_id, created_at: row.created_at });
       return;
     }
+    if (method === 'GET' && url.pathname === '/api/permissions') {
+      // Release 0.1.8 `GET /api/permissions`: `{ pending }` of `viewOf` cards.
+      if (permissionsRaw !== null) {
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(permissionsRaw);
+        return;
+      }
+      send(res, 200, { pending: [...permissions.values()] });
+      return;
+    }
     if (serveAutomation(method, url.pathname, bodyText, res, {
       pipelines,
       pipelineRuns,
@@ -398,6 +412,7 @@ export async function startFakeDaemon(options) {
     workflows,
     workflowRuns,
     routines,
+    permissions,
     /**
      * @param {{ status: number, body?: unknown, redirect?: boolean }} next
      */
@@ -420,6 +435,12 @@ export async function startFakeDaemon(options) {
      * @param {unknown} body
      */
     setWorkflowGet(body) { workflowGetOverride = body; },
+    /**
+     * Raw body of `GET /api/permissions`, instead of `{ pending }`.
+     * `null` restores the stored cards.
+     * @param {string | null} body
+     */
+    setPermissionsRaw(body) { permissionsRaw = body; },
     close() {
       return new Promise((resolve) => {
         server.close(() => resolve());

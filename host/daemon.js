@@ -56,6 +56,13 @@ export const TASK_LIST_TOO_LARGE = `too_large: GET /api/tasks exceeded ${TASK_LI
 export const AUTOMATION_READ_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
+ * `GET /api/permissions` returns every open card and this host sends no query,
+ * so the body cannot be shrunk. Same 1 MiB cap as every route that is not a
+ * task or automation list. Past it the tool says `too_large`, not unreachable.
+ */
+export const PERMISSIONS_TOO_LARGE = `too_large: GET /api/permissions exceeded ${RESPONSE_MAX_BYTES / (1024 * 1024)} MiB. Release 0.1.8 returns every pending card. This host sends no query, so it cannot shrink the body.`;
+
+/**
  * Serialised size of a run's `input`. Same cap as `MAX_PIPELINE_INPUT_BYTES`
  * and `MAX_WORKFLOW_INPUT_BYTES` in release 0.1.8.
  */
@@ -276,6 +283,16 @@ export const DAEMON_ROUTES = Object.freeze([
     method: 'GET',
     path: '/api/routines/:auto',
     maxBytes: AUTOMATION_READ_MAX_BYTES,
+  }),
+  Object.freeze({
+    // Read only. `POST /api/permissions/:id/resolve` is not this host's call.
+    // Release 0.1.8 accepts `mission_id`. This host does not send it: the
+    // poller diffs the whole list, and `list_pending` filters after the read.
+    name: 'permissions.list',
+    method: 'GET',
+    path: '/api/permissions',
+    maxBytes: RESPONSE_MAX_BYTES,
+    tooLarge: PERMISSIONS_TOO_LARGE,
   }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
@@ -619,6 +636,12 @@ function assertRunInput(method, path, body) {
 function readCap(route) {
   if (route.name === 'tasks.list') {
     return { bytes: TASK_LIST_MAX_BYTES, overflow: new DaemonBodyError() };
+  }
+  if (typeof route.tooLarge === 'string') {
+    return {
+      bytes: typeof route.maxBytes === 'number' ? route.maxBytes : RESPONSE_MAX_BYTES,
+      overflow: new DaemonBodyError(route.tooLarge),
+    };
   }
   if (typeof route.maxBytes === 'number') {
     return {

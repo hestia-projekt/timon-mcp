@@ -3,7 +3,8 @@ Description=Standalone host for the timon-mcp plugin
 # Example user unit. The operator installs it; this package does not enable it.
 # EnvironmentFile may set TIMON_MCP_PORT, TIMON_DAEMON_URL, TIMON_DAEMON_TOKEN_FILE,
 # TIMON_MCP_DB, TIMON_MCP_SETTINGS, TIMON_MCP_BEARER_TOKEN, TIMON_MCP_TRUST_PROXY,
-# TIMON_MCP_SPAWN_MAX and TIMON_MCP_SPAWN_WINDOW_MS.
+# TIMON_MCP_SPAWN_MAX, TIMON_MCP_SPAWN_WINDOW_MS, TIMON_MCP_PENDING_WEBHOOK_URL,
+# TIMON_MCP_PENDING_WEBHOOK_SECRET, and TIMON_MCP_PENDING_INTERVAL_MS.
 # Values belong in that file, never in this unit.
 
 [Service]

@@ -21,6 +21,7 @@ import { TOOLS, explainToolError, toolError, validateInput } from '../lib/mcp/to
 import { AUTOMATION_TOOLS } from './automation-tools.js';
 import { ROSTER_TOOLS } from './agent-tools.js';
 import { KANBAN_TOOLS } from './kanban-tools.js';
+import { PENDING_TOOLS } from './pending-tools.js';
 import { MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
 const STATUS_ENUM = ['running', 'completed', 'failed', 'terminated'];
@@ -204,7 +205,7 @@ export const MISSION_TOOLS = [
   },
 ];
 
-const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS, ROSTER_TOOLS, AUTOMATION_TOOLS);
+const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS, ROSTER_TOOLS, AUTOMATION_TOOLS, PENDING_TOOLS);
 const HOST_BY_NAME = new Map(HOST_TOOLS.map((tool) => [tool.name, tool]));
 
 /**
