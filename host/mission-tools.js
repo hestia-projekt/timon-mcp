@@ -6,8 +6,11 @@
  * Every call is checked against the closed daemon list before the network.
  * A missing plugin bearer is left to the plugin handler, which answers 401.
  */
+import { timingSafeEqual } from 'node:crypto';
+import { presentedBearer } from '../lib/auth/body.js';
+import { sha256Hex } from '../lib/auth/crypto.js';
 import { authenticate } from '../lib/auth/index.js';
-import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
+import { BEARER_SECRET, MESSAGE_MAX_CHARS } from '../lib/constants.js';
 import {
   INTERNAL_ERROR,
   INVALID_PARAMS,
@@ -21,6 +24,7 @@ import { TOOLS, explainToolError, toolError, validateInput } from '../lib/mcp/to
 import { AUTOMATION_TOOLS } from './automation-tools.js';
 import { ROSTER_TOOLS } from './agent-tools.js';
 import { KANBAN_TOOLS } from './kanban-tools.js';
+import { DECISION_TOOLS } from './decision-tools.js';
 import { PENDING_TOOLS } from './pending-tools.js';
 import { MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
@@ -205,7 +209,13 @@ export const MISSION_TOOLS = [
   },
 ];
 
-const HOST_TOOLS = MISSION_TOOLS.concat(KANBAN_TOOLS, ROSTER_TOOLS, AUTOMATION_TOOLS, PENDING_TOOLS);
+const HOST_TOOLS = MISSION_TOOLS.concat(
+  KANBAN_TOOLS,
+  ROSTER_TOOLS,
+  AUTOMATION_TOOLS,
+  PENDING_TOOLS,
+  DECISION_TOOLS,
+);
 const HOST_BY_NAME = new Map(HOST_TOOLS.map((tool) => [tool.name, tool]));
 
 /**
@@ -253,7 +263,8 @@ async function handle(req, res, next, ctx) {
       res.status(200).json(rpcError(target.message.id, INVALID_PARAMS, validated.message));
       return;
     }
-    const data = await target.tool.run(ctx, validated.value);
+    const caller = target.tool.needsCaller ? await resolveCaller(req, ctx) : undefined;
+    const data = await target.tool.run(ctx, validated.value, caller);
     res.status(200).json(rpcResult(target.message.id, toolSuccess(data)));
   } catch (err) {
     if (res.headersSent) return;
@@ -282,6 +293,50 @@ function hostTarget(req) {
   const tool = HOST_BY_NAME.get(name);
   if (!tool) return null;
   return { kind: 'call', message, tool, arguments: params ? params.arguments : undefined };
+}
+
+/**
+ * The OAuth subject already stored for this bearer, or the static bearer.
+ * The token itself is not returned. A subject that is not a digest is ignored.
+ * @param {object} req
+ * @param {object} ctx
+ * @returns {Promise<{ kind: 'static' } | { kind: 'oauth', subject: string } | { kind: 'none' }>}
+ */
+async function resolveCaller(req, ctx) {
+  const presented = presentedBearer(req);
+  if (!presented.present || !presented.token) return { kind: 'none' };
+  let staticToken;
+  try {
+    staticToken = await ctx.secrets.get(BEARER_SECRET);
+  } catch {
+    staticToken = undefined;
+  }
+  if (typeof staticToken === 'string' && sameSecret(staticToken, presented.token)) {
+    return { kind: 'static' };
+  }
+  let row;
+  try {
+    row = ctx.sql.prepare(
+      `SELECT subject FROM oauth_tokens
+       WHERE token_hash = ? AND kind = 'access' AND revoked_at IS NULL`,
+    ).get(sha256Hex(presented.token));
+  } catch {
+    return { kind: 'none' };
+  }
+  const subject = row && typeof row.subject === 'string' ? row.subject : '';
+  if (!/^[0-9a-f]{64}$/.test(subject)) return { kind: 'none' };
+  return { kind: 'oauth', subject };
+}
+
+/**
+ * @param {string} left
+ * @param {string} right
+ */
+function sameSecret(left, right) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  if (a.length === 0 || a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 function publicTools() {

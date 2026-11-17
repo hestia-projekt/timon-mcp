@@ -4,8 +4,8 @@
  * `questions:read` or `events:subscribe`: this host does not call
  * `ctx.questions` or `ctx.events.on`.
  *
- * The tool does not answer a card. `POST /api/permissions/:id/resolve` is
- * not a route of this host.
+ * The tool does not answer a card. Answering is `answer_question` and
+ * `resolve_approval`.
  */
 import { MISSION_ID } from './names.js';
 

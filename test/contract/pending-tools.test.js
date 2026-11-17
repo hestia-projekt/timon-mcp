@@ -266,7 +266,7 @@ test('list_pending projects questions, plans and approvals and drops the raw car
   assert.equal(stack.daemon.requests.length, before);
 });
 
-test('a permissions read past 1 MiB is too_large and resolve stays off the list', async (t) => {
+test('a permissions read past 1 MiB is too_large and a non-uuid resolve stays off the network', async (t) => {
   const secret = randomBytes(24).toString('hex');
   const stack = await openStack(t);
   const client = createDaemonClient({

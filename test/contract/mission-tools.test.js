@@ -33,9 +33,11 @@ const ROUTES = [
   'GET /api/routines',
   'GET /api/routines/:auto',
   'GET /api/permissions',
+  'POST /api/permissions/:card/resolve',
+  'GET /api/auth/me',
 ];
 
-test('the closed list is the twenty-eight daemon routes, including the permissions read', () => {
+test('the closed list is the thirty daemon routes, including resolve and the account id', () => {
   assert.deepEqual(
     DAEMON_ROUTES.map((route) => `${route.method} ${route.path}`),
     ROUTES,
