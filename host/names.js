@@ -117,11 +117,11 @@ export function isNamedAgent(value) {
 }
 
 /**
- * An agent name the daemon will show on a card.
+ * An agent name the daemon will show.
  * Release 0.1.8 `validName` in `agent-config.js` is `/^[A-Za-z0-9._-]+$/`.
  * This host keeps that shape and caps it at 80 characters. An ephemeral id
- * (`_eph-…`) matches. This is not a name the host will place on a path:
- * that stays `isNamedAgent`.
+ * (`_eph-…`) matches. A launch or a direct message stays `isNamedAgent`.
+ * A name this host places on a path uses `isAgentPath`.
  */
 export const DISPLAY_AGENT = /^[A-Za-z0-9._-]{1,80}$/;
 
@@ -130,6 +130,39 @@ export const DISPLAY_AGENT = /^[A-Za-z0-9._-]{1,80}$/;
  */
 export function isDisplayAgent(value) {
   return typeof value === 'string' && DISPLAY_AGENT.test(value);
+}
+
+/**
+ * A display name safe to send on a read.
+ * `GET /api/agents/:name` in release 0.1.8 calls `getAgent`, which accepts
+ * `validName` and returns an ephemeral agent. The same check is used for a
+ * list filter and for `stop_scope`, so a dangerous token is refused before
+ * it can be placed on a path: `.` alone, a name that contains `..`, a
+ * percent-encoding (`%` is outside the display grammar, so `%2f` fails),
+ * and the route words `active`, `spawn`, `ephemeral`, and `main`.
+ */
+export const AGENT_PATH = /^(?!(?:active|spawn|ephemeral|main)$)(?!\.$)(?!.*\.\.)[A-Za-z0-9._-]{1,80}$/;
+
+/**
+ * @param {unknown} value
+ */
+export function isAgentPath(value) {
+  return typeof value === 'string' && AGENT_PATH.test(value);
+}
+
+/**
+ * A display name copied out of a daemon row.
+ * `_eph-…` is kept. `.` and a name that contains `..` are not: they are
+ * paths, not labels. A reserved route word is kept when the daemon sent it,
+ * because a projection does not place the name on a path. `get_agent`
+ * still refuses that word.
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function shownAgent(value) {
+  if (!isDisplayAgent(value)) return null;
+  if (value === '.' || value.includes('..')) return null;
+  return value;
 }
 
 /**

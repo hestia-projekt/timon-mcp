@@ -72,6 +72,13 @@ export async function startFakeDaemon(options) {
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
   }
+  const ephemeralMission = missionRow('ephmission01', '_eph-7f3a9c1e', null);
+  ephemeralMission.parent_agent = '_eph-7f3a9c1e';
+  missions.set('ephmission01', ephemeralMission);
+  const unsafeMission = missionRow('badagentmis01', '../secret', null);
+  unsafeMission.parent_agent = '../secret';
+  unsafeMission.children = [{ id: 'childmis01', agent_name: '../secret', status: 'running', started_at: 1 }];
+  missions.set('badagentmis01', unsafeMission);
   projects.set('alpha', projectRow('alpha', { name: 'Alpha', status: 'active' }));
   projects.set('beta', projectRow('beta', { name: 'Beta', status: 'paused' }));
   projects.set('/secret/skip', projectRow('/secret/skip', { name: 'Nope', status: 'active' }));
@@ -99,6 +106,36 @@ export async function startFakeDaemon(options) {
       updated_at: 11,
     }));
   }
+  tasks.set('ephtask0001', taskRow('ephtask0001', {
+    title: 'Ephemeral task',
+    description: '',
+    status: 'PENDING',
+    agent_name: '_eph-7f3a9c1e',
+    project: 'alpha',
+    type: 'chore',
+    priority: 1,
+    deps: '[]',
+    base_branch: null,
+    blocked_reason: null,
+    done_comment: null,
+    created_at: 20,
+    updated_at: 21,
+  }));
+  tasks.set('badtask0001', taskRow('badtask0001', {
+    title: 'Unsafe agent',
+    description: '',
+    status: 'PENDING',
+    agent_name: '../secret',
+    project: 'alpha',
+    type: 'chore',
+    priority: 1,
+    deps: '[]',
+    base_branch: null,
+    blocked_reason: null,
+    done_comment: null,
+    created_at: 22,
+    updated_at: 23,
+  }));
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
@@ -541,11 +578,19 @@ function projectRow(slug, fields) {
 /**
  * Agents the list and the detail routes return in release 0.1.8.
  * The list has no system-prompt text. The detail handler adds it.
- * Names that are not `_main` or `<project>.<role>` are here so a projection
- * that copies every row would leak them.
+ * `not-named` is a display name that is not `_main` or `<project>.<role>`.
+ * `_eph-7f3a9c1e` is an ephemeral agent. Both must be listed without the prompt.
+ * A projection that copies every row would leak the prompt.
  */
 function seededAgents() {
   return [
+    agentRow('_eph-7f3a9c1e', {
+      role: 'coder',
+      project: null,
+      orchestrator: false,
+      reports_to: null,
+      ephemeral: true,
+    }),
     agentRow('_main', { role: 'orchestrator', project: null, orchestrator: true, reports_to: null }),
     agentRow('alpha.coder', {
       role: 'coder',
@@ -569,7 +614,7 @@ function seededAgents() {
       role: 'coder',
       project: 'alpha',
       orchestrator: false,
-      reports_to: null,
+      reports_to: '_eph-7f3a9c1e',
       system_prompt: 'LEAKED NAME PROMPT',
     }),
   ];
@@ -577,7 +622,7 @@ function seededAgents() {
 
 /**
  * @param {string} name
- * @param {{ role: string, project: string | null, orchestrator: boolean, reports_to: string | null, system_prompt?: string }} fields
+ * @param {{ role: string, project: string | null, orchestrator: boolean, reports_to: string | null, ephemeral?: boolean, system_prompt?: string }} fields
  */
 function agentRow(name, fields) {
   return {
@@ -597,7 +642,7 @@ function agentRow(name, fields) {
     team: 'secret-team',
     project: fields.project,
     memory_scope: 'NONE',
-    ephemeral: false,
+    ephemeral: fields.ephemeral === true,
     orchestrator: fields.orchestrator,
     orchestrates: ['alpha.coder'],
     global_context: false,

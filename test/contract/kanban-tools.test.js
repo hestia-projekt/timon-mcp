@@ -320,6 +320,16 @@ test('task routes, queries, encoded paths, and override fields never reach the d
     ['add_task', { project: 'alpha', title: 'T', agent: 'alpha.coder', type: 'code', fallback: 'none' }],
     ['add_task', { project: 'alpha', title: 'T', agent: 'alpha.coder', type: 'ops' }],
     ['add_task', { project: 'alpha', title: 'T', agent: 'other', type: 'chore' }],
+    ['add_task', { project: 'alpha', title: 'T', agent: '_eph-7f3a9c1e', type: 'chore' }],
+    ['update_task', { task_id: FOREIGN, agent: '_eph-7f3a9c1e' }],
+    ['list_all_tasks', { agent: '..' }],
+    ['list_all_tasks', { agent: '.' }],
+    ['list_all_tasks', { agent: '%2f' }],
+    ['list_all_tasks', { agent: 'active' }],
+    ['list_all_tasks', { agent: 'spawn' }],
+    ['list_all_tasks', { agent: 'ephemeral' }],
+    ['list_all_tasks', { agent: 'main' }],
+    ['list_all_tasks', { agent: 'foo..bar' }],
     ['add_task', { project: 'nope/../x', title: 'T', agent: 'alpha.coder', type: 'chore' }],
     ['update_task', { task_id: FOREIGN, title: 'T', backend_override: 'other' }],
     ['update_task', { task_id: FOREIGN, model_override: 'other' }],
@@ -479,6 +489,29 @@ test('done_comment is stored only when the status changes', async (t) => {
   assert.equal(gone.body.result.isError, true);
   assert.equal(gone.body.result.content[0].text, 'unknown tool');
   assert.equal(stack.daemon.requests.length, before);
+});
+
+test('an ephemeral agent filters tasks, and a path is not copied out', async (t) => {
+  const stack = await openStack(t, { foreignTaskId: FOREIGN });
+  const listed = await call(stack, 'list_all_tasks', { agent: '_eph-7f3a9c1e' });
+  assert.equal(listed.body.result.isError, false);
+  assert.deepEqual(listed.body.result.structuredContent.tasks.map((row) => row.id), ['ephtask0001']);
+  assert.equal(listed.body.result.structuredContent.tasks[0].agent_name, '_eph-7f3a9c1e');
+  assert.equal(stack.daemon.requests.at(-1).search, '');
+
+  const hidden = await call(stack, 'get_task', { task_id: 'badtask0001' });
+  assert.equal(hidden.body.result.isError, false);
+  assert.equal(hidden.body.result.structuredContent.agent_name, null);
+  assert.equal(hidden.text.includes('../secret'), false);
+
+  const created = await call(stack, 'add_task', {
+    project: 'alpha', title: 'Nope', agent: '_eph-7f3a9c1e', type: 'chore',
+  });
+  assert.equal(created.body.result, undefined);
+  assert.equal(created.body.error.code, -32602);
+  const updated = await call(stack, 'update_task', { task_id: FOREIGN, agent: '_eph-7f3a9c1e' });
+  assert.equal(updated.body.result, undefined);
+  assert.equal(updated.body.error.code, -32602);
 });
 
 /**

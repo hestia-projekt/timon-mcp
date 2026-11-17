@@ -15,7 +15,7 @@
  * `questionKindOf` is the same split as the release (`permissions.js`):
  * `ask_user` whose payload does not validate is not a question.
  */
-import { isDisplayAgent, isMissionId } from './names.js';
+import { isMissionId, shownAgent } from './names.js';
 
 /** Cards the poller will diff. Above this, a missing tail must not look resolved. */
 export const PENDING_CARD_CAP = 200;
@@ -226,7 +226,7 @@ function timestamp(value) {
 
 /**
  * One card, or `null` when the id, mission, or agent cannot be shown.
- * The agent is a display name (`isDisplayAgent`), not a path name.
+ * The agent is a display name (`shownAgent`), including `_eph-…`. `.` and `..` are dropped.
  * The returned object is built field by field. An approval has no tool input:
  * that shape is what a webhook may carry.
  * @param {unknown} raw
@@ -236,7 +236,8 @@ export function projectCard(raw) {
   if (!isPlain(raw)) return null;
   if (typeof raw.id !== 'string' || !CARD_ID.test(raw.id)) return null;
   if (!isMissionId(raw.mission_id)) return null;
-  if (!isDisplayAgent(raw.agent)) return null;
+  const agent = shownAgent(raw.agent);
+  if (!agent) return null;
   const created = timestamp(raw.created_at);
   if (created === null) return null;
   const timeout = timestamp(raw.timeout_ms);
@@ -248,7 +249,7 @@ export function projectCard(raw) {
   const base = {
     id: raw.id.toLowerCase(),
     mission_id: raw.mission_id,
-    agent: raw.agent,
+    agent,
     created_at: created,
     expires_at: expires,
   };

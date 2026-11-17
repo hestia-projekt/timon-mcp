@@ -26,7 +26,7 @@ import { ROSTER_TOOLS } from './agent-tools.js';
 import { KANBAN_TOOLS } from './kanban-tools.js';
 import { DECISION_TOOLS } from './decision-tools.js';
 import { PENDING_TOOLS } from './pending-tools.js';
-import { MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
+import { AGENT_PATH, MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
 const STATUS_ENUM = ['running', 'completed', 'failed', 'terminated'];
 
@@ -48,17 +48,18 @@ function schema(description, properties, required) {
 }
 
 const missionId = { type: 'string', minLength: 1, maxLength: 200, pattern: MISSION_ID.source };
-const agentName = { type: 'string', pattern: NAMED_AGENT.source };
+const namedAgent = { type: 'string', pattern: NAMED_AGENT.source };
+const readAgent = { type: 'string', pattern: AGENT_PATH.source };
 const message = { type: 'string', minLength: 1, maxLength: MESSAGE_MAX_CHARS };
 
 export const MISSION_TOOLS = [
   {
     name: 'list_all_missions',
     ...schema(
-      'Lists every mission on this Timon, not only the ones this host started. Filters: project, agent (`_main` or `<project>.<role>`), and status (running, completed, failed, terminated). The prompt is not returned.',
+      'Lists every mission on this Timon, not only the ones this host started. Filters: project, agent (a display name, including an ephemeral `_eph-…`; `.`, `..`, and the route words active, spawn, ephemeral, and main are refused), and status (running, completed, failed, terminated). The prompt is not returned.',
       {
         project: { type: 'string', pattern: PROJECT_NAME.source },
-        agent: agentName,
+        agent: readAgent,
         status: { type: 'string', enum: STATUS_ENUM },
         limit: { type: 'integer', minimum: 1, maximum: 100 },
       },
@@ -172,9 +173,9 @@ export const MISSION_TOOLS = [
   {
     name: 'stop_scope',
     ...schema(
-      'Stops one agent (`_main` or `<project>.<role>`) or one project. Pass exactly one of agent or project. The call counts against the host spawn window.',
+      'Stops one agent (a display name, including an ephemeral `_eph-…`) or one project. Pass exactly one of agent or project. `.`, `..`, and the route words active, spawn, ephemeral, and main are refused. The call counts against the host spawn window.',
       {
-        agent: agentName,
+        agent: readAgent,
         project: { type: 'string', pattern: PROJECT_NAME.source },
       },
     ),
@@ -190,7 +191,7 @@ export const MISSION_TOOLS = [
     name: 'launch_mission',
     ...schema(
       'Starts a mission on an agent that already exists: `_main`, or `<project>.<role>`. The host does not create the agent. Backend, model, skills, MCP servers, and permission are not parameters. The call counts against the host spawn window.',
-      { agent: agentName, message },
+      { agent: namedAgent, message },
       ['agent', 'message'],
     ),
     /**

@@ -9,10 +9,11 @@
  * `blocked_reason` is the reason stored for `BLOCKED`. There is no delete.
  */
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
-import { MISSION_ID, NAMED_AGENT, PROJECT_NAME, TASK_STATUS_NAMES, TASK_TYPE_NAMES } from './names.js';
+import { AGENT_PATH, MISSION_ID, NAMED_AGENT, PROJECT_NAME, TASK_STATUS_NAMES, TASK_TYPE_NAMES } from './names.js';
 
 const taskId = { type: 'string', minLength: 1, maxLength: 200, pattern: MISSION_ID.source };
-const agentName = { type: 'string', pattern: NAMED_AGENT.source };
+const namedAgent = { type: 'string', pattern: NAMED_AGENT.source };
+const readAgent = { type: 'string', pattern: AGENT_PATH.source };
 const projectName = { type: 'string', pattern: PROJECT_NAME.source };
 const priority = { type: 'integer', minimum: -1000, maximum: 1000 };
 const deps = {
@@ -43,10 +44,10 @@ export const KANBAN_TOOLS = [
   {
     name: 'list_all_tasks',
     ...schema(
-      'Lists tasks on this Timon. Filters: project, agent (`_main` or `<project>.<role>`), status (PENDING, IN_PROGRESS, DONE, BLOCKED), and type (code, review, merge, research, doc, chore). Release 0.1.8 has no limit, project, agent, type, or pagination on GET /api/tasks: only status is sent, and project, agent, and type are applied after the body is read. A body past 8 MiB fails with too_large; pass status, or read one task with get_task. The description, the comment, overrides, and paths are not returned.',
+      'Lists tasks on this Timon. Filters: project, agent (a display name, including an ephemeral `_eph-…`; `.`, `..`, and the route words active, spawn, ephemeral, and main are refused), status (PENDING, IN_PROGRESS, DONE, BLOCKED), and type (code, review, merge, research, doc, chore). Release 0.1.8 has no limit, project, agent, type, or pagination on GET /api/tasks: only status is sent, and project, agent, and type are applied after the body is read. A body past 8 MiB fails with too_large; pass status, or read one task with get_task. The description, the comment, overrides, and paths are not returned.',
       {
         project: projectName,
-        agent: agentName,
+        agent: readAgent,
         status: { type: 'string', enum: [...TASK_STATUS_NAMES] },
         type: { type: 'string', enum: [...TASK_TYPE_NAMES] },
         limit: { type: 'integer', minimum: 1, maximum: 100 },
@@ -84,7 +85,7 @@ export const KANBAN_TOOLS = [
         project: projectName,
         title: { type: 'string', minLength: 1, maxLength: 500 },
         description: { type: 'string', maxLength: MESSAGE_MAX_CHARS },
-        agent: agentName,
+        agent: namedAgent,
         type: { type: 'string', enum: [...TASK_TYPE_NAMES] },
         base: { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9._/-]+$' },
         deps,
@@ -110,7 +111,7 @@ export const KANBAN_TOOLS = [
         description: { type: 'string', maxLength: MESSAGE_MAX_CHARS },
         priority,
         deps,
-        agent: agentName,
+        agent: namedAgent,
       },
       ['task_id'],
     ),

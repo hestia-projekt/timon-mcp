@@ -21,6 +21,7 @@ import {
   DIRECT_FROM_AGENT,
   DIRECT_FROM_MISSION,
   MESSAGE_KIND_NAMES,
+  isAgentPath,
   isGitRef,
   isMissionId,
   isNamedAgent,
@@ -28,6 +29,7 @@ import {
   isTaskStatus,
   isTaskType,
   isWorkReturnPayload,
+  shownAgent,
 } from './names.js';
 
 const PROJECT = new RegExp(PROJECT_PATTERN);
@@ -594,7 +596,7 @@ export function createRosterFacade(deps) {
      * @param {unknown} name
      */
     async read(name) {
-      if (!isNamedAgent(name)) throw new PluginMissionError('invalid', 'agent is invalid');
+      if (!isAgentPath(name)) throw new PluginMissionError('invalid', 'agent is invalid');
       const result = await callMission(() => client.request('GET', `/api/agents/${name}`));
       if (result.status === 404) throw new PluginMissionError('agent_not_found', 'Agent not found.');
       if (result.status !== 200 || !isPlain(result.json)) {
@@ -684,9 +686,10 @@ function projectRosterRow(row) {
  * @param {Record<string, unknown>} row
  */
 function agentListRow(row) {
-  if (!isNamedAgent(row.name)) return null;
+  const name = shownAgent(row.name);
+  if (!name) return null;
   return {
-    name: row.name,
+    name,
     role: safeLabel(row.role, 40),
     project: isProject(row.project) ? row.project : null,
     orchestrator: row.orchestrator === true,
@@ -703,7 +706,7 @@ function agentDetail(row) {
   if (!base) return null;
   return {
     ...base,
-    reports_to: isNamedAgent(row.reports_to) ? row.reports_to : null,
+    reports_to: shownAgent(row.reports_to),
     ephemeral: row.ephemeral === true,
   };
 }
@@ -951,7 +954,7 @@ function taskListFilter(opts) {
     filter.project = record.project;
   }
   if (record.agent !== undefined) {
-    if (!isNamedAgent(record.agent)) throw new PluginTaskError('invalid', 'agent is invalid');
+    if (!isAgentPath(record.agent)) throw new PluginTaskError('invalid', 'agent is invalid');
     filter.agent = record.agent;
   }
   if (record.status !== undefined) {
@@ -988,7 +991,7 @@ function projectTaskList(task) {
     id: asString(task.id),
     title: asString(task.title),
     status: asString(task.status),
-    agent_name: asString(task.agent_name),
+    agent_name: shownAgent(task.agent_name),
     project: asString(task.project),
     type: asString(task.type),
     priority: Number.isInteger(task.priority) ? task.priority : null,
@@ -1176,7 +1179,7 @@ function listQuery(opts) {
     query.project = record.project;
   }
   if (record.agent !== undefined) {
-    if (!isNamedAgent(record.agent)) throw new PluginMissionError('invalid', 'agent is invalid');
+    if (!isAgentPath(record.agent)) throw new PluginMissionError('invalid', 'agent is invalid');
     query.agent = record.agent;
   }
   if (record.status !== undefined) {
@@ -1205,7 +1208,7 @@ function stopBody(input) {
   }
   const value = record[keys[0]];
   if (keys[0] === 'agent') {
-    if (!isNamedAgent(value)) throw new PluginMissionError('invalid', 'agent is invalid');
+    if (!isAgentPath(value)) throw new PluginMissionError('invalid', 'agent is invalid');
     return { agent: value };
   }
   if (!isProject(value)) throw new PluginMissionError('invalid', 'project is invalid');
@@ -1245,7 +1248,7 @@ function pickMission(json) {
   /** @type {Record<string, unknown>} */
   const mission = {
     id: typeof json.id === 'string' ? json.id : null,
-    agent_name: typeof json.agent_name === 'string' ? json.agent_name : null,
+    agent_name: shownAgent(json.agent_name),
     status: typeof json.status === 'string' ? json.status : null,
     title: typeof json.title === 'string' ? json.title : null,
     summary: typeof json.summary === 'string' ? json.summary : null,
@@ -1264,7 +1267,7 @@ function pickMission(json) {
 function projectListRow(json) {
   return {
     id: asString(json.id),
-    agent_name: asString(json.agent_name),
+    agent_name: shownAgent(json.agent_name),
     status: asString(json.status),
     title: asString(json.title),
     started_at: asStamp(json.started_at),
@@ -1291,7 +1294,7 @@ function projectDetail(json) {
     source_channel: asShort(json.source_channel),
     origin: asShort(json.origin),
     parent_mission_id: asString(json.parent_mission_id),
-    parent_agent: asString(json.parent_agent),
+    parent_agent: shownAgent(json.parent_agent),
     routine_id: asString(json.routine_id),
     pending_action_at: asStamp(json.pending_action_at),
     pending_action_id: asString(json.pending_action_id),
@@ -1306,7 +1309,7 @@ function projectChildren(value) {
   if (!Array.isArray(value)) return [];
   return value.slice(0, 20).filter(isPlain).map((row) => ({
     id: asString(row.id),
-    agent_name: asString(row.agent_name),
+    agent_name: shownAgent(row.agent_name),
     status: asString(row.status),
     started_at: asStamp(row.started_at),
   }));
@@ -1355,16 +1358,24 @@ function boundText(text) {
 function projectStop(json) {
   const scope = isPlain(json.scope) ? json.scope : {};
   const kind = scope.kind === 'agent' || scope.kind === 'project' ? scope.kind : null;
-  const name = typeof scope.name === 'string' && scope.name.length <= 200 ? scope.name : null;
+  const rawName = typeof scope.name === 'string' ? scope.name : null;
+  const name = kind === 'agent'
+    ? shownAgent(rawName)
+    : kind === 'project' && isProject(rawName)
+      ? rawName
+      : null;
   const agents = Array.isArray(json.agents)
-    ? json.agents.filter((item) => typeof item === 'string' && item.length <= 200).slice(0, 100)
+    ? json.agents.flatMap((item) => {
+      const agent = shownAgent(item);
+      return agent ? [agent] : [];
+    }).slice(0, 100)
     : [];
   const missions = Array.isArray(json.missions)
     ? json.missions.filter(isPlain).slice(0, 100).map((row) => {
       const outcome = row.outcome;
       return {
         id: asString(row.id),
-        agent: asString(row.agent ?? row.agent_name),
+        agent: shownAgent(row.agent ?? row.agent_name),
         outcome: outcome === 'killed' || outcome === 'closed' || outcome === 'not_found' ? outcome : null,
       };
     })
@@ -1423,9 +1434,7 @@ function asInt(value) {
  * @param {Record<string, unknown>} task
  */
 function pickTask(task) {
-  const agent = typeof task.agent_name === 'string'
-    ? task.agent_name
-    : (typeof task.agent === 'string' ? task.agent : null);
+  const agent = shownAgent(task.agent_name) ?? shownAgent(task.agent);
   return {
     id: typeof task.id === 'string' ? task.id : null,
     title: typeof task.title === 'string' ? task.title : null,
