@@ -32,9 +32,10 @@ const ROUTES = [
   'POST /api/workflows/:auto/run',
   'GET /api/routines',
   'GET /api/routines/:auto',
+  'GET /api/permissions',
 ];
 
-test('the closed list is the twenty-seven mission, task, project, agent, and automation routes', () => {
+test('the closed list is the twenty-eight daemon routes, including the permissions read', () => {
   assert.deepEqual(
     DAEMON_ROUTES.map((route) => `${route.method} ${route.path}`),
     ROUTES,
