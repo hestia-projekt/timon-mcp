@@ -13,6 +13,7 @@ import { BEARER_SECRET, PLUGIN_ID, WAIT_MAX_S } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
 import { createDaemonClient, resolveDaemonOrigin } from './daemon.js';
 import { createMissionFacade, createSpawnQuota, createTaskFacade } from './facades.js';
+import { mountMissionTools } from './mission-tools.js';
 import { createResponse, createRouter } from './router.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -121,6 +122,9 @@ export async function startStandalone(options = {}) {
     router() {
       const router = createRouter();
       routers.push(router);
+      // Ahead of the plugin's `/mcp`, so tools/list includes the mission tools
+      // and a host tool never falls through to "unknown tool".
+      mountMissionTools(router, ctx);
       return router;
     },
     missions: createMissionFacade({ client, sql, quota }),
