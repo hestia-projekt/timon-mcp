@@ -16,9 +16,11 @@ const ROUTES = [
   'POST /api/stop',
   'POST /api/tasks',
   'GET /api/tasks/:id',
+  'GET /api/tasks',
+  'PUT /api/tasks/:id',
 ];
 
-test('the closed list is the eleven mission and task routes', () => {
+test('the closed list is the thirteen mission and task routes', () => {
   assert.deepEqual(
     DAEMON_ROUTES.map((route) => `${route.method} ${route.path}`),
     ROUTES,

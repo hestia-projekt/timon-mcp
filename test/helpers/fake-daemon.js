@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
  * @param {string} options.token Expected bearer. Compared, never logged.
  * @param {boolean} [options.echoToken] Reflect the token in extra JSON fields.
  * @param {string} [options.foreignId] A mission this host did not create.
+ * @param {string} [options.foreignTaskId] A task this host did not create.
  */
 export async function startFakeDaemon(options) {
   const token = options.token;
@@ -22,9 +23,28 @@ export async function startFakeDaemon(options) {
   const tasks = new Map();
   /** @type {{ status: number, body?: unknown, redirect?: boolean } | null} */
   let failNext = null;
+  /** @type {unknown} */
+  let taskListOverride = null;
 
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
+  }
+  if (options.foreignTaskId) {
+    tasks.set(options.foreignTaskId, taskRow(options.foreignTaskId, {
+      title: 'Foreign task',
+      description: 'SECRET DESCRIPTION',
+      status: 'BLOCKED',
+      agent_name: 'beta.reviewer',
+      project: 'beta',
+      type: 'review',
+      priority: 4,
+      deps: JSON.stringify(['dep-1']),
+      base_branch: 'main',
+      blocked_reason: 'needs a human',
+      done_comment: 'SECRET COMMENT',
+      created_at: 10,
+      updated_at: 11,
+    }));
   }
 
   const server = createServer(async (req, res) => {
@@ -175,26 +195,63 @@ export async function startFakeDaemon(options) {
       });
       return;
     }
+    if (method === 'GET' && url.pathname === '/api/tasks') {
+      if (taskListOverride !== null) {
+        send(res, 200, taskListOverride);
+        return;
+      }
+      const status = url.searchParams.get('status');
+      let rows = [...tasks.values()];
+      if (status) rows = rows.filter((row) => row.status === status);
+      send(res, 200, { tasks: rows, view: 'board' });
+      return;
+    }
     if (method === 'POST' && url.pathname === '/api/tasks') {
       const body = parseBody(bodyText);
       const id = randomUUID();
       const now = Date.now();
-      const task = {
-        id,
+      const task = taskRow(id, {
         title: body.title ?? '',
         description: body.description ?? '',
         status: 'PENDING',
         agent_name: body.agent_name ?? null,
         project: body.project ?? null,
         type: body.type ?? null,
+        priority: body.priority ?? 3,
+        deps: JSON.stringify(Array.isArray(body.deps) ? body.deps : []),
+        base_branch: typeof body.base === 'string' ? body.base : null,
+        blocked_reason: null,
+        done_comment: null,
         created_at: now,
         updated_at: now,
-        effective_backend: 'hidden-backend',
-        effective_model: 'hidden-model',
-        attachments: [{ name: 'hidden' }],
-      };
+      });
       tasks.set(id, task);
       send(res, 201, { task });
+      return;
+    }
+    if (method === 'PUT' && url.pathname.startsWith('/api/tasks/')) {
+      const id = url.pathname.slice('/api/tasks/'.length);
+      const task = tasks.get(id);
+      if (!task || id.includes('/')) {
+        send(res, 404, { error: 'not found', code: 'not_found' });
+        return;
+      }
+      const body = parseBody(bodyText);
+      if (typeof body.title === 'string') task.title = body.title;
+      if (typeof body.description === 'string') task.description = body.description;
+      if (typeof body.agent_name === 'string') task.agent_name = body.agent_name;
+      if (Number.isInteger(body.priority)) task.priority = body.priority;
+      if (Array.isArray(body.deps)) task.deps = JSON.stringify(body.deps);
+      // Release 0.1.8 writes `done_comment` and `blocked_reason` only inside the
+      // status transition. A comment alone, or the same status again, changes
+      // neither. A real transition stores both, and an omitted one becomes null.
+      if (typeof body.status === 'string' && body.status !== task.status) {
+        task.status = body.status;
+        task.done_comment = typeof body.done_comment === 'string' ? body.done_comment : null;
+        task.blocked_reason = typeof body.blocked_reason === 'string' ? body.blocked_reason : null;
+      }
+      task.updated_at = Date.now();
+      send(res, 200, { task });
       return;
     }
     if (method === 'GET' && url.pathname.startsWith('/api/tasks/')) {
@@ -229,12 +286,39 @@ export async function startFakeDaemon(options) {
      * @param {{ status: number, body?: unknown, redirect?: boolean }} next
      */
     failNext(next) { failNext = next; },
+    /**
+     * Body of the next `GET /api/tasks`, instead of the stored rows.
+     * `null` restores the stored rows. The status query is still recorded.
+     * @param {unknown} body
+     */
+    setTaskList(body) { taskListOverride = body; },
     close() {
       return new Promise((resolve) => {
         server.close(() => resolve());
         if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       });
     },
+  };
+}
+
+/**
+ * A task row plus the fields the host must not return.
+ * @param {string} id
+ * @param {Record<string, unknown>} fields
+ */
+function taskRow(id, fields) {
+  return {
+    id,
+    effective_backend: 'hidden-backend',
+    effective_model: 'hidden-model',
+    backend_override: 'hidden-backend',
+    fallback_backend_override: 'hidden-fallback',
+    permission_mode_override: 'auto',
+    extra_skills: ['hidden-skill'],
+    worktree_path: '/secret/worktree',
+    owner: { id: 'hidden-owner' },
+    attachments: [{ name: 'hidden' }],
+    ...fields,
   };
 }
 

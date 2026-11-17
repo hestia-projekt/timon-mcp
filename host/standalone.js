@@ -122,7 +122,7 @@ export async function startStandalone(options = {}) {
     router() {
       const router = createRouter();
       routers.push(router);
-      // Ahead of the plugin's `/mcp`, so tools/list includes the mission tools
+      // Ahead of the plugin's `/mcp`, so tools/list includes the host tools
       // and a host tool never falls through to "unknown tool".
       mountMissionTools(router, ctx);
       return router;

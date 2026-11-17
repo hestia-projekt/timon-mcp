@@ -43,9 +43,11 @@ const FORBIDDEN = [
   ['PUT', '/api/stop'],
   ['GET', '/api/stop'],
   ['GET', '/api/permissions'],
-  ['GET', '/api/tasks'],
-  ['PUT', '/api/tasks/abc'],
+  ['POST', '/api/tasks/close'],
+  ['PUT', '/api/tasks'],
+  ['PATCH', '/api/tasks/abc'],
   ['POST', '/api/tasks/abc/worktree'],
+  ['GET', '/api/tasks/abc/attachments'],
   ['GET', '/api/agents'],
   ['POST', '/api/agents/spawn'],
   ['POST', '/api/missions/delegate'],
@@ -76,7 +78,7 @@ test('the daemon client refuses every route outside the closed list', async (t) 
     rmSync(dir, { recursive: true, force: true });
   });
 
-  assert.equal(DAEMON_ROUTES.length, 11);
+  assert.equal(DAEMON_ROUTES.length, 13);
   for (const [method, path] of FORBIDDEN) {
     await assert.rejects(() => client.request(method, path), (err) => {
       assert.equal(err.code, 'route_denied');

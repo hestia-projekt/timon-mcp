@@ -8,7 +8,7 @@
  * into the journal, an error message, or a returned document.
  */
 import { readFileSync } from 'node:fs';
-import { DaemonCallError, DaemonRouteError } from './errors.js';
+import { DaemonBodyError, DaemonCallError, DaemonRouteError } from './errors.js';
 import {
   EVENT_ID,
   LIST_LIMIT,
@@ -17,10 +17,23 @@ import {
   NAMED_AGENT,
   PROJECT_NAME,
   RESERVED_MISSION_IDS,
+  TASK_STATUS,
 } from './names.js';
 
-/** Longest daemon body this client will parse. */
-const RESPONSE_MAX_BYTES = 1024 * 1024;
+/** Longest daemon body this client will parse, except `GET /api/tasks`. */
+export const RESPONSE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * `GET /api/tasks` returns every column of every row. Release 0.1.8 has no
+ * limit, project, agent, type, or pagination on that route. Its own board
+ * note records a 12 MB full-text answer for 2,571 tasks; the default view
+ * cuts the long texts, and this client never sends `full`. 8 MiB covers that
+ * preview with a margin. The read still stops at this cap.
+ */
+export const TASK_LIST_MAX_BYTES = 8 * 1024 * 1024;
+
+/** Tool-facing text when `GET /api/tasks` crosses `TASK_LIST_MAX_BYTES`. */
+export const TASK_LIST_TOO_LARGE = `too_large: GET /api/tasks exceeded ${TASK_LIST_MAX_BYTES / (1024 * 1024)} MiB. Release 0.1.8 has no limit, project, agent, type, or pagination. Pass status, or read one task with get_task.`;
 
 const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
 const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
@@ -87,12 +100,39 @@ export const DAEMON_ROUTES = Object.freeze([
     name: 'tasks.add',
     method: 'POST',
     path: '/api/tasks',
-    body: Object.freeze(['title', 'description', 'agent_name', 'type', 'project']),
+    // Required keys, plus the optional ones. A missing required key is refused.
+    // `backend`, `model`, `permission`, `fallback`, and the extra-* lists are not here.
+    body: Object.freeze(['title', 'description', 'agent_name', 'type', 'project', 'priority', 'deps', 'base']),
+    bodyRequired: Object.freeze(['title', 'description', 'agent_name', 'type', 'project']),
   }),
   Object.freeze({
     name: 'tasks.get',
     method: 'GET',
     path: '/api/tasks/:id',
+  }),
+  Object.freeze({
+    name: 'tasks.list',
+    method: 'GET',
+    path: '/api/tasks',
+    // Release 0.1.8 filters on `status` only. It has no limit, project, agent,
+    // type, or pagination. `full` returns the uncut texts and is refused.
+    // `done_limit` only windows DONE rows and still returns every other status,
+    // so it is not a bound. Project, agent, and type stay in the host, after
+    // this read. The read ceiling for this route is TASK_LIST_MAX_BYTES.
+    query: Object.freeze(['status']),
+    queryStatus: TASK_STATUS,
+  }),
+  Object.freeze({
+    name: 'tasks.update',
+    method: 'PUT',
+    path: '/api/tasks/:id',
+    // Move and edit. `done_comment` is stored by release 0.1.8 only when this
+    // same request changes the status, so the host never sends it alone.
+    // There is no DELETE: `kanban:delete` is not a gesture of this host.
+    body: Object.freeze([
+      'title', 'description', 'agent_name', 'priority', 'deps', 'status', 'blocked_reason', 'done_comment',
+    ]),
+    bodyRequired: Object.freeze([]),
   }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
@@ -259,9 +299,14 @@ export function createDaemonClient(options) {
       }
       let text = '';
       try {
-        text = await readCappedText(response);
+        const listing = route.name === 'tasks.list';
+        text = await readCappedText(
+          response,
+          listing ? TASK_LIST_MAX_BYTES : RESPONSE_MAX_BYTES,
+          listing ? new DaemonBodyError() : new DaemonCallError(),
+        );
       } catch (err) {
-        if (err instanceof DaemonCallError) throw err;
+        if (err instanceof DaemonCallError || err instanceof DaemonBodyError) throw err;
         throw new DaemonCallError();
       }
       let json = null;
@@ -301,7 +346,7 @@ function queryString(route, method, path, query) {
   const params = new URLSearchParams();
   for (const key of allowed) {
     if (query[key] === undefined) continue;
-    if (!queryValueOk(key, query[key])) throw new DaemonRouteError(method, path);
+    if (!queryValueOk(route, key, query[key])) throw new DaemonRouteError(method, path);
     params.append(key, query[key]);
   }
   const text = params.toString();
@@ -309,20 +354,21 @@ function queryString(route, method, path, query) {
 }
 
 /**
+ * @param {{ queryStatus?: RegExp }} route
  * @param {string} key
  * @param {unknown} value
  */
-function queryValueOk(key, value) {
+function queryValueOk(route, key, value) {
   if (typeof value !== 'string' || value !== value.trim()) return false;
   if (key === 'project') return PROJECT_NAME.test(value);
   if (key === 'agent') return NAMED_AGENT.test(value);
-  if (key === 'status') return LIST_STATUS.test(value);
+  if (key === 'status') return (route.queryStatus ?? LIST_STATUS).test(value);
   if (key === 'limit') return LIST_LIMIT.test(value);
   return false;
 }
 
 /**
- * @param {{ body?: readonly string[] | string }} route
+ * @param {{ body?: readonly string[] | string, bodyRequired?: readonly string[] }} route
  * @param {string} method
  * @param {string} path
  * @param {unknown} body
@@ -339,6 +385,17 @@ function assertBody(route, method, path, body) {
   if (!isPlain(body) || !Array.isArray(route.body)) throw new DaemonRouteError(method, path);
   const allowed = new Set(route.body);
   const keys = Object.keys(body);
+  if (Array.isArray(route.bodyRequired)) {
+    // A subset. Every required key is present, and at least one key is sent.
+    if (keys.length === 0) throw new DaemonRouteError(method, path);
+    for (const key of keys) {
+      if (!allowed.has(key)) throw new DaemonRouteError(method, path);
+    }
+    for (const key of route.bodyRequired) {
+      if (!Object.prototype.hasOwnProperty.call(body, key)) throw new DaemonRouteError(method, path);
+    }
+    return;
+  }
   if (keys.length !== allowed.size) throw new DaemonRouteError(method, path);
   for (const key of keys) {
     if (!allowed.has(key)) throw new DaemonRouteError(method, path);
@@ -372,10 +429,13 @@ function isPlain(value) {
 
 /**
  * Stops after one byte past the cap so a large daemon body is not buffered.
+ * The overflowing chunk is not kept, and the bytes are not parsed.
  * @param {Response} response
+ * @param {number} maxBytes
+ * @param {Error} overflow Thrown when the body crosses `maxBytes`.
  * @returns {Promise<string>}
  */
-async function readCappedText(response) {
+async function readCappedText(response, maxBytes, overflow) {
   const reader = response.body?.getReader();
   if (!reader) return '';
   /** @type {Uint8Array[]} */
@@ -386,15 +446,15 @@ async function readCappedText(response) {
       const step = await reader.read();
       if (step.done) break;
       size += step.value.byteLength;
-      if (size > RESPONSE_MAX_BYTES) {
-        await reader.cancel();
-        throw new DaemonCallError();
+      if (size > maxBytes) {
+        try { await reader.cancel(); } catch { /* the cap is the result */ }
+        throw overflow;
       }
       chunks.push(step.value);
     }
   } catch (err) {
     try { await reader.cancel(); } catch { /* already closed */ }
-    if (err instanceof DaemonCallError) throw err;
+    if (err instanceof DaemonCallError || err instanceof DaemonBodyError) throw err;
     throw new DaemonCallError();
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');

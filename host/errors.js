@@ -67,3 +67,15 @@ export class DaemonCallError extends Error {
     this.code = 'unreachable';
   }
 }
+
+/**
+ * The daemon answered with a body past the cap for that route.
+ * The message is fixed and carries no secret. The bytes are not parsed.
+ */
+export class DaemonBodyError extends Error {
+  constructor() {
+    super('daemon response is too large');
+    this.name = 'DaemonBodyError';
+    this.code = 'too_large';
+  }
+}
