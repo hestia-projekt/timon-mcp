@@ -9,7 +9,9 @@
  */
 import { readFileSync } from 'node:fs';
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
+import { ANSWER_NOTE_MAX, DENY_MESSAGE_MAX, UPDATED_INPUT_MAX_BYTES } from './answers.js';
 import { DaemonBodyError, DaemonCallError, DaemonRouteError } from './errors.js';
+import { CARD_ID } from './permissions.js';
 import {
   AUTOMATION_ID,
   DIRECT_FROM_AGENT,
@@ -99,6 +101,7 @@ const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
 const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
 const AGENT_SEGMENT = NAMED_AGENT.source.slice(1, -1);
 const AUTO_SEGMENT = AUTOMATION_ID.source.slice(1, -1);
+const CARD_SEGMENT = CARD_ID.source.slice(1, -1);
 
 /**
  * Couples the host is allowed to call. `:id` is one mission id.
@@ -285,7 +288,6 @@ export const DAEMON_ROUTES = Object.freeze([
     maxBytes: AUTOMATION_READ_MAX_BYTES,
   }),
   Object.freeze({
-    // Read only. `POST /api/permissions/:id/resolve` is not this host's call.
     // Release 0.1.8 accepts `mission_id`. This host does not send it: the
     // poller diffs the whole list, and `list_pending` filters after the read.
     name: 'permissions.list',
@@ -293,6 +295,22 @@ export const DAEMON_ROUTES = Object.freeze([
     path: '/api/permissions',
     maxBytes: RESPONSE_MAX_BYTES,
     tooLarge: PERMISSIONS_TOO_LARGE,
+  }),
+  Object.freeze({
+    // Narrower than the release route. `scope`, `paste`, and any key other
+    // than `behavior`, `message`, and `updatedInput` are refused before fetch.
+    // `updatedInput` is `{ answers, note? }` or `{ plan }`, never both.
+    name: 'permissions.resolve',
+    method: 'POST',
+    path: '/api/permissions/:card/resolve',
+    body: 'permission-resolve',
+  }),
+  Object.freeze({
+    // Account id of the daemon token. The host keeps `user.id` and drops the
+    // rest. The address in this payload is never logged or returned.
+    name: 'auth.me',
+    method: 'GET',
+    path: '/api/auth/me',
   }),
 ].map((route) => Object.freeze({ ...route, re: compileRoute(route.path) })));
 
@@ -305,6 +323,7 @@ function compileRoute(path) {
     if (segment === ':eventId') return EVENT_SEGMENT;
     if (segment === ':name') return AGENT_SEGMENT;
     if (segment === ':auto') return AUTO_SEGMENT;
+    if (segment === ':card') return CARD_SEGMENT;
     if (segment.startsWith(':') && segment.length > 1) return '[^/]+';
     return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }).join('/');
@@ -565,6 +584,10 @@ function assertBody(route, method, path, body) {
     assertStopBody(method, path, body);
     return;
   }
+  if (route.body === 'permission-resolve') {
+    assertPermissionBody(method, path, body);
+    return;
+  }
   if (!isPlain(body) || !Array.isArray(route.body)) throw new DaemonRouteError(method, path);
   const allowed = new Set(route.body);
   const keys = Object.keys(body);
@@ -674,6 +697,78 @@ function assertDirectMessage(method, path, body) {
     throw new DaemonRouteError(method, path);
   }
   if (isWorkReturnPayload(body.payload)) throw new DaemonRouteError(method, path);
+}
+
+/**
+ * Resolve body. An approval is `{ behavior: "allow" }` or
+ * `{ behavior: "deny", message? }`. A question adds `updatedInput` of
+ * `{ answers, note? }` or `{ plan }`. `scope`, `paste`, and every other key
+ * are refused before fetch.
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} body
+ */
+function assertPermissionBody(method, path, body) {
+  if (!isPlain(body)) throw new DaemonRouteError(method, path);
+  if (body.behavior !== 'allow' && body.behavior !== 'deny') throw new DaemonRouteError(method, path);
+  const keys = Object.keys(body);
+  for (const key of keys) {
+    if (key !== 'behavior' && key !== 'message' && key !== 'updatedInput') {
+      throw new DaemonRouteError(method, path);
+    }
+  }
+  if (body.behavior === 'deny') {
+    if (Object.prototype.hasOwnProperty.call(body, 'updatedInput')) throw new DaemonRouteError(method, path);
+    if (!Object.prototype.hasOwnProperty.call(body, 'message')) {
+      if (keys.length !== 1) throw new DaemonRouteError(method, path);
+      return;
+    }
+    if (keys.length !== 2) throw new DaemonRouteError(method, path);
+    if (typeof body.message !== 'string' || body.message.length < 1 || body.message.length > DENY_MESSAGE_MAX) {
+      throw new DaemonRouteError(method, path);
+    }
+    if (body.message.includes('\u0000')) throw new DaemonRouteError(method, path);
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'message')) throw new DaemonRouteError(method, path);
+  if (!Object.prototype.hasOwnProperty.call(body, 'updatedInput')) {
+    if (keys.length !== 1) throw new DaemonRouteError(method, path);
+    return;
+  }
+  if (keys.length !== 2) throw new DaemonRouteError(method, path);
+  assertUpdatedInput(method, path, body.updatedInput);
+}
+
+/**
+ * @param {string} method
+ * @param {string} path
+ * @param {unknown} value
+ */
+function assertUpdatedInput(method, path, value) {
+  if (!isPlain(value)) throw new DaemonRouteError(method, path);
+  const keys = Object.keys(value);
+  const answers = Object.prototype.hasOwnProperty.call(value, 'answers');
+  const plan = Object.prototype.hasOwnProperty.call(value, 'plan');
+  const note = Object.prototype.hasOwnProperty.call(value, 'note');
+  if (answers === plan) throw new DaemonRouteError(method, path);
+  if (plan && note) throw new DaemonRouteError(method, path);
+  for (const key of keys) {
+    if (key !== 'answers' && key !== 'plan' && key !== 'note') throw new DaemonRouteError(method, path);
+  }
+  if (answers && !isPlain(value.answers)) throw new DaemonRouteError(method, path);
+  if (plan && !isPlain(value.plan)) throw new DaemonRouteError(method, path);
+  if (note) {
+    if (typeof value.note !== 'string' || value.note.length < 1 || value.note.length > ANSWER_NOTE_MAX) {
+      throw new DaemonRouteError(method, path);
+    }
+  }
+  let size;
+  try {
+    size = Buffer.byteLength(JSON.stringify(value));
+  } catch {
+    throw new DaemonRouteError(method, path);
+  }
+  if (size > UPDATED_INPUT_MAX_BYTES) throw new DaemonRouteError(method, path);
 }
 
 /**

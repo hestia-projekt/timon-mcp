@@ -13,6 +13,7 @@ import { BEARER_SECRET, PLUGIN_ID, WAIT_MAX_S } from '../lib/constants.js';
 import { apply } from '../lib/index.js';
 import { createDaemonClient, resolveDaemonOrigin, scrubValue } from './daemon.js';
 import { createAutomationFacade } from './automation.js';
+import { createDecisions } from './decisions.js';
 import { createMissionFacade, createRosterFacade, createSpawnQuota, createTaskFacade } from './facades.js';
 import { mountMissionTools } from './mission-tools.js';
 import { createPendingWatcher } from './pending.js';
@@ -95,7 +96,8 @@ export async function startStandalone(options = {}) {
   const pendingIntervalMs = readPendingInterval(env.TIMON_MCP_PENDING_INTERVAL_MS);
   const webhook = resolveWebhookConfig(env);
   const trustProxy = env.TIMON_MCP_TRUST_PROXY === '1';
-  const quota = createSpawnQuota(env, typeof options.now === 'function' ? options.now : Date.now);
+  const now = typeof options.now === 'function' ? options.now : Date.now;
+  const quota = createSpawnQuota(env, now);
   const origin = daemonOrigin(options, env);
   const port = listenPort(options, env);
   const tokenFile = options.tokenFile || env.TIMON_DAEMON_TOKEN_FILE || join(homedir(), '.timon', 'daemon-token');
@@ -118,6 +120,8 @@ export async function startStandalone(options = {}) {
   const disposers = [];
   /** @type {ReturnType<typeof createPendingWatcher> | null} */
   let pending = null;
+  /** @type {ReturnType<typeof createDecisions> | null} */
+  let decisions = null;
   /** @type {ReturnType<typeof createRouter>[]} */
   const routers = [];
   const buckets = new Map();
@@ -147,6 +151,28 @@ export async function startStandalone(options = {}) {
       list(args) {
         if (!pending) throw new Error('pending list is not ready');
         return pending.list(args);
+      },
+    },
+    decisions: {
+      /**
+       * @param {Record<string, unknown>} args
+       * @param {{ kind?: string, subject?: string }} caller
+       */
+      answer(args, caller) {
+        return decisions.answer(args, caller);
+      },
+      /**
+       * @param {Record<string, unknown>} args
+       * @param {{ kind?: string, subject?: string }} caller
+       */
+      resolveApproval(args, caller) {
+        return decisions.resolveApproval(args, caller);
+      },
+      /**
+       * @param {{ limit?: unknown }} [args]
+       */
+      list(args) {
+        return decisions.list(args);
       },
     },
     events: {
@@ -198,7 +224,7 @@ export async function startStandalone(options = {}) {
     sql,
     webhook,
     sleep: options.sleep,
-    now: typeof options.now === 'function' ? options.now : Date.now,
+    now,
     log(message) {
       const needles = webhook ? [webhook.secret] : [];
       const scrubbed = client.scrub(scrubValue(message, needles));
@@ -206,6 +232,16 @@ export async function startStandalone(options = {}) {
     },
   });
   disposers.push(() => pending.stop());
+  // Answering does not emit `resolved`. The watcher above does, once, when
+  // the next poll no longer sees the card.
+  decisions = createDecisions({
+    client,
+    sql,
+    now,
+    log(message) {
+      ctx.log.warn(message);
+    },
+  });
 
   const server = createServer((incoming, raw) => {
     installResponseGuard(raw);

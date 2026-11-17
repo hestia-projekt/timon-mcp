@@ -33,7 +33,8 @@ const GROUP_NAME_CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 /** Characters kept from a tool command on the authenticated list. */
 const COMMAND_PREVIEW_MAX = 160;
 
-const CARD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Lowercase UUID, the only card id this host will place on a resolve path. */
+export const CARD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
 const BEARER_VALUE = /Bearer\s+\S+/gi;
 const LONG_HEX = /[0-9a-fA-F]{32,}/g;

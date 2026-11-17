@@ -5,6 +5,16 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { DIRECT_FROM_AGENT, DIRECT_FROM_MISSION } from '../../host/names.js';
+import { CARD_ID } from '../../host/permissions.js';
+
+/** Account id the fake `GET /api/auth/me` returns unless a test replaces it. */
+export const FAKE_ACCOUNT_ID = 'operator-1';
+/** Address on that payload. The host must not log it, store it, or return it. */
+export const FAKE_ACCOUNT_EMAIL = 'secret-address@example.test';
+/** Display name on that payload. Same rule as the address. */
+export const FAKE_ACCOUNT_NAME = 'Secret Name';
+/** Preference on that payload. Same rule as the address. */
+export const FAKE_ACCOUNT_THEME = 'secret-theme';
 
 /**
  * @param {object} [options]
@@ -50,6 +60,14 @@ export async function startFakeDaemon(options) {
   const permissions = new Map();
   /** @type {string | null} */
   let permissionsRaw = null;
+  /**
+   * `user` of `GET /api/auth/me`. `null` is a daemon token with no account.
+   * `'omit'` drops the key. The address stays on the default user.
+   * @type {Record<string, unknown> | null | 'omit'}
+   */
+  let accountUser = fakeAccountUser();
+  /** @type {{ status: number, body?: unknown } | null} */
+  let nextResolve = null;
 
   if (options.foreignId) {
     missions.set(options.foreignId, missionRow(options.foreignId, '_main', echoToken ? token : null));
@@ -377,6 +395,36 @@ export async function startFakeDaemon(options) {
       send(res, 200, { pending: [...permissions.values()] });
       return;
     }
+    if (method === 'GET' && url.pathname === '/api/auth/me') {
+      // Release 0.1.8 `mePayload`: the address is on `user`. The host may
+      // keep `user.id` and must drop everything else.
+      send(res, 200, fakeMe(accountUser));
+      return;
+    }
+    if (method === 'POST' && url.pathname.startsWith('/api/permissions/') && url.pathname.endsWith('/resolve')) {
+      const id = url.pathname.slice('/api/permissions/'.length, -'/resolve'.length);
+      if (!CARD_ID.test(id)) {
+        send(res, 500, { error: 'unexpected route' });
+        return;
+      }
+      // Release 0.1.8: an unknown card is 404 `{ error, code }`, not nested.
+      if (!permissions.has(id)) {
+        send(res, 404, {
+          error: 'permission request not found (already resolved or expired)',
+          code: 'permission_request_gone',
+        });
+        return;
+      }
+      const override = nextResolve;
+      nextResolve = null;
+      if (override && override.status !== 200) {
+        send(res, override.status, override.body ?? { error: 'failed' });
+        return;
+      }
+      permissions.delete(id);
+      send(res, 200, override && override.body !== undefined ? override.body : { ok: true });
+      return;
+    }
     if (serveAutomation(method, url.pathname, bodyText, res, {
       pipelines,
       pipelineRuns,
@@ -441,6 +489,20 @@ export async function startFakeDaemon(options) {
      * @param {string | null} body
      */
     setPermissionsRaw(body) { permissionsRaw = body; },
+    /**
+     * `user` of the next `GET /api/auth/me`. `null` is a daemon token with
+     * no account. `'omit'` removes the key. The default is restored by
+     * passing the object `fakeAccountUser()` returns.
+     * @param {Record<string, unknown> | null | 'omit'} user
+     */
+    setAccount(user) { accountUser = user; },
+    /**
+     * Next `POST /api/permissions/:id/resolve`, once. Status 200 deletes the
+     * card and returns `body` (default `{ ok: true }`). Any other status
+     * leaves the card in place.
+     * @param {{ status: number, body?: unknown } | null} next
+     */
+    setNextResolve(next) { nextResolve = next; },
     close() {
       return new Promise((resolve) => {
         server.close(() => resolve());
@@ -626,6 +688,44 @@ function storedMessage(missionId, eventId) {
     return { event_id: 2, role: 'user', timestamp: 11, text: `${'a'.repeat(20_000)}TAIL` };
   }
   return null;
+}
+
+/**
+ * `toPublicUser` fields the host must not return, plus the id it may keep.
+ */
+function fakeAccountUser() {
+  return {
+    id: FAKE_ACCOUNT_ID,
+    email: FAKE_ACCOUNT_EMAIL,
+    name: FAKE_ACCOUNT_NAME,
+    avatar_url: null,
+    is_superadmin: true,
+  };
+}
+
+/**
+ * Release 0.1.8 `mePayload`, plus the two setup flags the route adds.
+ * @param {Record<string, unknown> | null | 'omit'} user
+ */
+function fakeMe(user) {
+  /** @type {Record<string, unknown>} */
+  const body = {
+    needsSetup: false,
+    setupRequiresToken: false,
+    prefs: { theme: FAKE_ACCOUNT_THEME, scheme: 'dark' },
+    can: {
+      'projects:manage': true,
+      'agents:manage': true,
+      'agents:privileged-config': true,
+      'providers:manage': true,
+      'providers:accounts': true,
+    },
+    welcome: null,
+    setupRequiresLicense: false,
+    setupRequiresEmailCode: false,
+  };
+  if (user !== 'omit') body.user = user;
+  return body;
 }
 
 /**

@@ -27,6 +27,7 @@ test('initialize, tools/list and ask_main stay on the closed daemon routes', asy
     'list_workflows', 'get_workflow', 'list_workflow_runs', 'run_workflow',
     'list_routines', 'get_routine',
     'list_pending',
+    'answer_question', 'resolve_approval', 'list_decisions',
   ]);
 
   const asked = await rpc(stack, 'tools/call', {
