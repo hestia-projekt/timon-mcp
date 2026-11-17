@@ -3,12 +3,25 @@ import { test } from 'node:test';
 import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
 import {
   AUTOMATION_READ_MAX_BYTES,
+  DAEMON_ROUTES,
   RESPONSE_MAX_BYTES,
   RUN_INPUT_MAX_BYTES,
   automationTooLarge,
   createDaemonClient,
 } from '../../host/daemon.js';
 import { openStack } from '../helpers/standalone.js';
+
+/** Exact `too_large` text. Release 0.1.8 has no shrinking query on these routes. */
+const AUTOMATION_TOO_LARGE = Object.freeze({
+  'GET /api/pipelines': 'too_large: GET /api/pipelines exceeded 8 MiB. Release 0.1.8 returns every pipeline and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/pipelines/:auto': 'too_large: GET /api/pipelines/:auto exceeded 8 MiB. This call already reads one pipeline. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/pipelines/runs/:auto': 'too_large: GET /api/pipelines/runs/:auto exceeded 8 MiB. This call already reads one pipeline run. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/workflows': 'too_large: GET /api/workflows exceeded 8 MiB. Release 0.1.8 returns every workflow and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/workflows/:auto': 'too_large: GET /api/workflows/:auto exceeded 8 MiB. This call already reads one workflow. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/workflows/:auto/runs': 'too_large: GET /api/workflows/:auto/runs exceeded 8 MiB. Release 0.1.8 returns every run of this workflow and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/routines': 'too_large: GET /api/routines exceeded 8 MiB. Release 0.1.8 returns every routine and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/routines/:auto': 'too_large: GET /api/routines/:auto exceeded 8 MiB. This call already reads one routine. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+});
 
 const NEEDLES = [
   'SECRET PIPELINE PROMPT',
@@ -565,6 +578,17 @@ test('an unpublished workflow run still takes a slot', async (t) => {
   assert.equal(stack.daemon.requests.length, 1);
 });
 
+test('automation too_large names the route and does not suggest limit', () => {
+  const reads = DAEMON_ROUTES.filter((route) => route.maxBytes === AUTOMATION_READ_MAX_BYTES);
+  assert.deepEqual(reads.map((route) => `${route.method} ${route.path}`), Object.keys(AUTOMATION_TOO_LARGE));
+  for (const [route, text] of Object.entries(AUTOMATION_TOO_LARGE)) {
+    const space = route.indexOf(' ');
+    assert.equal(automationTooLarge(route.slice(0, space), route.slice(space + 1)), text, route);
+    assert.equal(text.includes('Pass limit'), false, route);
+    assert.equal(/\blimit\b/.test(text), false, route);
+  }
+});
+
 test('a pipeline list past 1 MiB is read, and past the ceiling it is too_large', async (t) => {
   const stack = await openStack(t);
   const wide = pipelinePage(RESPONSE_MAX_BYTES + 4096);
@@ -590,7 +614,8 @@ test('a pipeline list past 1 MiB is read, and past the ceiling it is too_large',
   stack.daemon.setPipelinesList(over);
   const huge = await call(stack, 'list_pipelines', {});
   assert.equal(huge.body.result.isError, true);
-  assert.equal(huge.body.result.content[0].text, automationTooLarge('GET', '/api/pipelines'));
+  assert.equal(huge.body.result.content[0].text, AUTOMATION_TOO_LARGE['GET /api/pipelines']);
+  assert.equal(huge.text.includes('Pass limit'), false);
   assert.equal(huge.text.includes('daemon is unreachable'), false);
   assert.equal(huge.text.includes('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'), false);
 
@@ -599,7 +624,8 @@ test('a pipeline list past 1 MiB is read, and past the ceiling it is too_large',
   });
   const detail = await call(stack, 'get_workflow', { workflow_id: 'wf-1' });
   assert.equal(detail.body.result.isError, true);
-  assert.equal(detail.body.result.content[0].text, automationTooLarge('GET', '/api/workflows/:auto'));
+  assert.equal(detail.body.result.content[0].text, AUTOMATION_TOO_LARGE['GET /api/workflows/:auto']);
+  assert.equal(detail.text.includes('Pass limit'), false);
   assert.equal(detail.text.includes('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'), false);
 });
 

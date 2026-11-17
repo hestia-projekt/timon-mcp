@@ -44,9 +44,14 @@ export const TASK_LIST_MAX_BYTES = 8 * 1024 * 1024;
 export const TASK_LIST_TOO_LARGE = `too_large: GET /api/tasks exceeded ${TASK_LIST_MAX_BYTES / (1024 * 1024)} MiB. Release 0.1.8 has no limit, project, agent, type, or pagination. Pass status, or read one task with get_task.`;
 
 /**
- * Pipelines, workflows, and routines have no limit or pagination on release
- * 0.1.8. A workflow list carries every draft, and a run list carries every
- * `context`. Same ceiling as `GET /api/tasks`.
+ * Pipelines, workflows, and routines. A workflow list carries every draft,
+ * and a run list carries every `context`. Same ceiling as `GET /api/tasks`.
+ *
+ * Release 0.1.8 has no query that shrinks the eight routes this host reads.
+ * `limit` and `project` run after that body is in memory, and a get already
+ * asks for one row. `GET /api/workflows/runs` does take `limit`, and
+ * `GET /api/workflows/runs/:runId` takes `spans_limit`, but this host does
+ * not call those routes.
  */
 export const AUTOMATION_READ_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -57,12 +62,30 @@ export const AUTOMATION_READ_MAX_BYTES = 8 * 1024 * 1024;
 export const RUN_INPUT_MAX_BYTES = 64 * 1024;
 
 /**
+ * One sentence per route. A missing route still refuses to suggest `limit`:
+ * that parameter does not shrink the body the daemon already sent.
+ * @type {Readonly<Record<string, string>>}
+ */
+const AUTOMATION_TOO_LARGE_NOTE = Object.freeze({
+  'GET /api/pipelines': 'Release 0.1.8 returns every pipeline and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/pipelines/:auto': 'This call already reads one pipeline. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/pipelines/runs/:auto': 'This call already reads one pipeline run. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/workflows': 'Release 0.1.8 returns every workflow and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/workflows/:auto': 'This call already reads one workflow. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+  'GET /api/workflows/:auto/runs': 'Release 0.1.8 returns every run of this workflow and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/routines': 'Release 0.1.8 returns every routine and has no query that shrinks this response. The host cannot reduce this response.',
+  'GET /api/routines/:auto': 'This call already reads one routine. Release 0.1.8 has no query that shrinks it, so the host cannot reduce this response.',
+});
+
+/**
  * @param {string} method
- * @param {string} path
+ * @param {string} path Route pattern, such as `/api/workflows/:auto`.
  */
 export function automationTooLarge(method, path) {
   const mib = AUTOMATION_READ_MAX_BYTES / (1024 * 1024);
-  return `too_large: ${method} ${path} exceeded ${mib} MiB. Release 0.1.8 has no limit or pagination on this route. Pass limit, or read one item.`;
+  const note = AUTOMATION_TOO_LARGE_NOTE[`${method} ${path}`]
+    ?? 'Release 0.1.8 has no query that shrinks this response. The host cannot reduce this response.';
+  return `too_large: ${method} ${path} exceeded ${mib} MiB. ${note}`;
 }
 
 const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
