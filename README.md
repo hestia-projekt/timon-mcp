@@ -287,9 +287,9 @@ Pending cards are read from `GET /api/permissions` and projected before they lea
 
 The host polls that same route on a timer. `TIMON_MCP_PENDING_INTERVAL_MS` is the gap in milliseconds (default 5000, minimum 1000, maximum 60000). An empty value uses the default. Any other value refuses to start, with the text `TIMON_MCP_PENDING_INTERVAL_MS is invalid`. The first poll waits one interval. A tick that arrives while a pass is still reading is ignored. The pass enqueues webhook work and returns without waiting for a try, a retry, or a timeout. Card ids are stored in the host sqlite table `host_pending_cards`, so a restart does not send `pending` again for an id already recorded. Resolved rows are kept up to 200 and the oldest are deleted past that. A card that was not stored, or that was stored as `resolved` and has come back, produces the event `pending`. A stored `pending` id that is absent from a complete list produces `resolved`, using the projection that was stored. A stored `pending` id that the list still contains, but that this host cannot project, stays `pending` and is not sent again. A projection that changed while the card is still pending is written back and is not sent again. A poll that fails, or a list of more than 200 cards, changes nothing: a missing tail must not look resolved. The log then says `pending poll failed`, `pending poll too_large`, or `pending list is over the cap`, and does not include the body. With no webhook URL the poll still records ids, and nothing is sent. A recorded id is not sent again as `pending` if a URL is set later. A `resolved` event can arrive for a card that was recorded before that URL was set, once the card leaves a complete list. A card that was never recorded does not produce `resolved`.
 
-`TIMON_MCP_PENDING_WEBHOOK_URL` is that URL. Leave it unset or empty to send nothing. `https` is required. `http` is accepted only when the host is `127.0.0.1`, `localhost`, or `::1`. A userinfo, a query, a hash, a space, or a length past 2000 characters is refused before the process listens, with the text `pending webhook URL is invalid`. The message does not include the URL. Redirects are not followed: a 3xx is a failed attempt. `TIMON_MCP_PENDING_WEBHOOK_SECRET` is required when a URL is set. It is a string of 16 to 512 characters, read from the environment file, and it is never written to the repository, a test, a journal, or a log. A missing or unusable secret refuses to start with the text `pending webhook secret is missing`, and that text does not include the secret. The secret is not a settings key.
+`TIMON_MCP_PENDING_WEBHOOK_URL` is that URL. Leave it unset or empty to send nothing. `https` is required. `http` is accepted only when the host is `127.0.0.1`, `localhost`, or `::1`. A userinfo, a query, a hash, a space, or a length past 2000 characters is refused before the process listens, with the text `pending webhook URL is invalid`. The message does not include the URL. Redirects are not followed: a 3xx is a failed attempt. `TIMON_MCP_PENDING_WEBHOOK_SECRET` is required when a URL is set. It is a string of 16 to 512 characters, read from the environment file, and it is never written to the repository, a test, a journal, or a log. A missing or unusable secret refuses to start with the text `pending webhook secret is missing`, and that text does not include the secret. The secret is not a settings key. A secret that starts with `whsec_` is a Standard Webhooks secret: the host base64-decodes the characters after the prefix and uses those bytes as the key of `webhook-signature`. Those characters must be canonical base64 (alphabet `A-Za-z0-9+/`, `=` padding, and encoding the decoded bytes returns the same text). Otherwise the host refuses to start, with the text `pending webhook secret is not valid base64`, and that text does not include the secret. A secret that does not start with `whsec_` uses its UTF-8 bytes as that key. `x-timon-signature` always uses the secret string as given, including a `whsec_` prefix when one is present. It does not use the decoded bytes.
 
-Each event is one `POST` of `{"event":"pending"|"resolved","card":<projection>}`. The headers are `content-type: application/json`, `x-timon-timestamp` (Unix milliseconds, decimal), and `x-timon-signature` (`v1=` plus the hex HMAC-SHA256 of `${timestamp}.${rawBody}`, where `rawBody` is the exact bytes of the POST). Each attempt is signed again with a fresh timestamp. The receiver should read the raw body, reject a timestamp more than five minutes from its clock, and compare the hex with a constant-time check:
+Each event is one `POST` of `{"event":"pending"|"resolved","card":<projection>}`. The headers are `content-type: application/json`, `x-timon-timestamp` (Unix milliseconds, decimal), and `x-timon-signature` (`v1=` plus the hex HMAC-SHA256 of `${timestamp}.${rawBody}`, where `rawBody` is the exact bytes of the POST). The same POST also carries the Standard Webhooks headers. `webhook-id` is `<event>_<card id>`, for example `pending_` followed by the card UUID. It is the same value on every attempt of that event, and the `pending` and `resolved` events of one card differ. `webhook-timestamp` is that same clock reading, written as Unix seconds. `webhook-signature` is `v1,` plus the base64 HMAC-SHA256 of `${webhook-id}.${webhook-timestamp}.${rawBody}`, using the key rule above. Each attempt takes a new timestamp and signs both headers again. The id does not change, and `x-timon-timestamp` stays the millisecond value: it is not rewritten from the seconds. The receiver should read the raw body, reject a timestamp more than five minutes from its clock, and compare with a constant-time check:
 
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -308,7 +308,41 @@ function verifyPendingWebhook(secret, rawBody, timestampHeader, signatureHeader)
 }
 ```
 
-Deliveries run on a separate queue. At most 4 run at once, and at most 32 are outstanding, waiting and in flight together. A card that does not fit is left unrecorded; a later poll tries it again. The log then says `pending delivery queue is full`, with no card body. A delivery is tried three times. The waits before the second and third tries are 200 ms and 800 ms. Each try stops after 5 seconds. The card is recorded after those tries finish, including when they fail, so a later poll does not send that event again. A restart before the record still sends it. After the third failure the host logs `pending webhook abandoned event=<event> id=<card id>` and does not log the body, the URL, or the secret. The caller that receives the webhook is configured by the operator. This package does not wire that caller.
+The Standard Webhooks check uses the same body and the key rule above. Hermes Agent checks these headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`):
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+const MAX_SKEW_S = 5 * 60;
+
+function standardWebhookKey(secret) {
+  if (secret.startsWith('whsec_')) return Buffer.from(secret.slice('whsec_'.length), 'base64');
+  return Buffer.from(secret, 'utf8');
+}
+
+function verifyStandardWebhook(secret, rawBody, idHeader, timestampHeader, signatureHeader) {
+  if (!/^[0-9]{1,16}$/.test(timestampHeader)) return false;
+  const timestamp = Number(timestampHeader);
+  if (!Number.isSafeInteger(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > MAX_SKEW_S) return false;
+  const expected = createHmac('sha256', standardWebhookKey(secret))
+    .update(`${idHeader}.${timestampHeader}.${rawBody}`)
+    .digest('base64');
+  const got = signatureHeader.startsWith('v1,') ? signatureHeader.slice(3) : '';
+  const a = Buffer.from(expected);
+  const b = Buffer.from(got);
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
+```
+
+Hermes Agent subscribes the route with the same secret. The command takes the route name, not a URL (`hermes webhook subscribe --help`):
+
+```
+hermes webhook subscribe <name> --secret <the same secret>
+```
+
+`<name>` is the route name. Hermes receives the POST at `/webhooks/<name>`. Set `TIMON_MCP_PENDING_WEBHOOK_URL` to that URL. Pass `--secret`: without it, Hermes generates a different secret. This package does not create the subscription.
+
+Deliveries run on a separate queue. At most 4 run at once, and at most 32 are outstanding, waiting and in flight together. A card that does not fit is left unrecorded; a later poll tries it again. The log then says `pending delivery queue is full`, with no card body. A delivery is tried three times. The waits before the second and third tries are 200 ms and 800 ms. Each try stops after 5 seconds. The card is recorded after those tries finish, including when they fail, so a later poll does not send that event again. A restart before the record still sends it. After the third failure the host logs `pending webhook abandoned event=<event> id=<card id>` and does not log the body, the URL, the secret, the decoded key, or a signature. The caller that receives the webhook is configured by the operator. This package does not wire that caller.
 
 An example user unit is `deploy/timon-mcp-standalone.service`. It loads `EnvironmentFile=-%h/.config/timon-mcp/standalone.env` and contains no secret. `deploy/timon-mcp-standalone.env.example` lists the variable names, including the webhook URL, the webhook secret, and the poll interval, with no values. The operator copies it, fills the secret outside the repository, replaces `ExecStart` with the checkout (the program, `host/` and `lib/` stay together), and installs the unit. This package does not install it.
 

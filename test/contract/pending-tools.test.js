@@ -94,6 +94,30 @@ test('the host refuses a non-https webhook URL and a missing secret before it li
       }),
       (err) => err.message === 'pending webhook secret is missing',
     );
+    const badTail = `${randomBytes(12).toString('base64')}*`;
+    const badSecret = `whsec_${badTail}`;
+    const unpadded = `whsec_${'abc'.repeat(6)}`;
+    const nonCanonical = `whsec_${'ab=='.repeat(4)}`;
+    for (const sample of [badSecret, unpadded, nonCanonical]) {
+      assert.ok(sample.length >= 16 && sample.length <= 512);
+      await assert.rejects(
+        () => startStandalone({
+          env: {
+            TIMON_DAEMON_URL: 'http://127.0.0.1:9',
+            TIMON_MCP_PENDING_WEBHOOK_URL: 'https://hooks.example/hook',
+            TIMON_MCP_PENDING_WEBHOOK_SECRET: sample,
+          },
+          port: 0,
+          tokenFile: join(dir, 'token'),
+          dbFile: join(dir, 'state.db'),
+          pendingPoll: false,
+        }),
+        (err) => err.message === 'pending webhook secret is not valid base64'
+          && !err.message.includes(sample)
+          && !String(err.stack || '').includes(sample)
+          && !err.message.includes(badTail),
+      );
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -355,6 +379,9 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   await stack.host.settlePending();
   assert.deepEqual(delays, [200]);
   assert.equal(receiver.requests.length, 2);
+  assert.equal(header(receiver.requests[0].headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  verifySignature(receiver.requests[0], hookSecret);
   const delivered = receiver.requests[1];
   assert.equal(delivered.url, '/hook');
   assert.equal(delivered.body.includes(cardSecret), false);
@@ -410,8 +437,79 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   assert.equal(resolved.body.includes(cardSecret), false);
   assert.equal(resolved.body.includes(hookSecret), false);
   verifySignature(resolved, hookSecret);
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}`);
+  assert.notEqual(header(resolved.headers, 'webhook-id'), header(delivered.headers, 'webhook-id'));
+  assertAbsent(JSON.stringify(stack.logs), [...secretMaterial(hookSecret), ...signatureMaterial(receiver.requests)]);
   assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
   assert.equal(JSON.stringify(stack.logs).includes(cardSecret), false);
+});
+
+test('a whsec_ webhook is signed again on each attempt and keeps one id per event', async (t) => {
+  const cardSecret = randomBytes(24).toString('hex');
+  const decoded = randomBytes(24).toString('hex');
+  const hookSecret = `whsec_${Buffer.from(decoded, 'utf8').toString('base64')}`;
+  assert.notEqual(cardSecret, hookSecret);
+  assert.notEqual(decoded, hookSecret);
+  let failuresLeft = 1;
+  const receiver = await startReceiver(() => {
+    if (failuresLeft > 0) {
+      failuresLeft -= 1;
+      return { status: 500 };
+    }
+    return { status: 204 };
+  });
+  t.after(() => receiver.close());
+  let tick = 0;
+  const origin = Date.now();
+  const base = origin - (origin % 1000) + 123;
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+    now: () => {
+      tick += 1;
+      return base + tick * 1000;
+    },
+  });
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 2);
+  const [first, second] = receiver.requests;
+  assert.equal(header(first.headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  assert.equal(header(second.headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  assert.notEqual(header(first.headers, 'webhook-timestamp'), header(second.headers, 'webhook-timestamp'));
+  assert.notEqual(header(first.headers, 'webhook-signature'), header(second.headers, 'webhook-signature'));
+  assert.notEqual(header(first.headers, 'x-timon-timestamp'), header(second.headers, 'x-timon-timestamp'));
+  for (const request of [first, second]) {
+    verifySignature(request, hookSecret);
+    assert.equal(Number(header(request.headers, 'x-timon-timestamp')) % 1000, 123);
+  }
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 3);
+  const resolved = receiver.requests[2];
+  assert.equal(JSON.parse(resolved.body).event, 'resolved');
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}`);
+  assert.notEqual(header(resolved.headers, 'webhook-id'), header(first.headers, 'webhook-id'));
+  verifySignature(resolved, hookSecret);
+
+  const leaked = [
+    ...secretMaterial(hookSecret),
+    decoded,
+    ...signatureMaterial(receiver.requests),
+  ];
+  assertAbsent(JSON.stringify(stack.logs), leaked);
+  assertAbsent(JSON.stringify(stack.journal), leaked);
+  for (const request of receiver.requests) {
+    assert.equal(request.body.includes(hookSecret), false);
+    assert.equal(request.body.includes(decoded), false);
+    assert.equal(request.body.includes(cardSecret), false);
+  }
 });
 
 test('a refused webhook is abandoned after three tries and a redirect is not followed', async (t) => {
@@ -825,6 +923,77 @@ function verifySignature(request, secret) {
   assert.equal(left.length, right.length);
   assert.equal(timingSafeEqual(left, right), true);
   assert.equal(request.body.includes(secret), false);
+  verifyStandardWebhook(request, secret);
+}
+
+/**
+ * Standard Webhooks check, written here and not imported from the host.
+ * A `whsec_` secret uses the decoded payload. Any other secret is UTF-8.
+ * @param {{ headers: Record<string, string | string[] | undefined>, body: string }} request
+ * @param {string} secret
+ */
+function verifyStandardWebhook(request, secret) {
+  const id = header(request.headers, 'webhook-id');
+  const timestamp = header(request.headers, 'webhook-timestamp');
+  const signature = header(request.headers, 'webhook-signature');
+  const millis = header(request.headers, 'x-timon-timestamp');
+  assert.match(id, /^[A-Za-z0-9._-]+$/);
+  assert.match(timestamp, /^[0-9]+$/);
+  assert.equal(timestamp, String(Math.floor(Number(millis) / 1000)));
+  assert.notEqual(timestamp, millis);
+  const key = secret.startsWith('whsec_')
+    ? Buffer.from(secret.slice('whsec_'.length), 'base64')
+    : Buffer.from(secret, 'utf8');
+  const expected = createHmac('sha256', key).update(`${id}.${timestamp}.${request.body}`).digest('base64');
+  const got = signature.startsWith('v1,') ? signature.slice(3) : '';
+  const left = Buffer.from(expected);
+  const right = Buffer.from(got);
+  assert.equal(left.length, right.length);
+  assert.equal(left.length > 0, true);
+  assert.equal(timingSafeEqual(left, right), true);
+}
+
+/**
+ * @param {string} secret
+ */
+function secretMaterial(secret) {
+  /** @type {string[]} */
+  const values = [secret];
+  if (secret.startsWith('whsec_')) {
+    const encoded = secret.slice('whsec_'.length);
+    values.push(encoded);
+    const key = Buffer.from(encoded, 'base64');
+    const utf8 = key.toString('utf8');
+    if (Buffer.from(utf8, 'utf8').equals(key)) values.push(utf8);
+    values.push(key.toString('hex'));
+  }
+  return values;
+}
+
+/**
+ * @param {Array<{ headers: Record<string, string | string[] | undefined> }>} requests
+ */
+function signatureMaterial(requests) {
+  /** @type {string[]} */
+  const values = [];
+  for (const request of requests) {
+    const standard = header(request.headers, 'webhook-signature');
+    const legacy = header(request.headers, 'x-timon-signature');
+    if (standard.startsWith('v1,')) values.push(standard.slice(3), standard);
+    if (legacy.startsWith('v1=')) values.push(legacy.slice(3), legacy);
+  }
+  return values;
+}
+
+/**
+ * @param {string} text
+ * @param {string[]} values
+ */
+function assertAbsent(text, values) {
+  for (const value of values) {
+    if (value.length < 8) continue;
+    assert.equal(text.includes(value), false);
+  }
 }
 
 /**
