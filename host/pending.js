@@ -22,6 +22,9 @@
  * resolved card row does not delete the count.
  * A card `projectCard` refuses stays seen for that pass. The host logs the
  * id only. `resolved` is emitted only when the id is absent from the list.
+ * An approval stored before `command` existed has no such key. The resolved
+ * webhook adds `command: null`: the original text cannot be recovered.
+ * A stored question or plan is sent as it was.
  */
 import { PERMISSIONS_TOO_LARGE } from './daemon.js';
 import {
@@ -58,6 +61,18 @@ const DROPPED_ID_MAX = 200;
  */
 function isPlain(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Old approval rows were stored without `command`. The text is gone, so the
+ * resolved webhook carries `command: null`. A question or a plan is unchanged.
+ * An approval that already has the key, including `null`, is left as stored.
+ * @param {Record<string, unknown>} card
+ * @returns {Record<string, unknown>}
+ */
+function resolvedCard(card) {
+  if (card.type !== 'approval' || Object.hasOwn(card, 'command')) return card;
+  return { ...card, command: null };
 }
 
 /**
@@ -403,7 +418,7 @@ export function createPendingWatcher(options) {
         store.save(row.id, 'resolved', { id: row.id }, now());
         continue;
       }
-      if (!recordOrEnqueue('resolved', card)) queueFull = true;
+      if (!recordOrEnqueue('resolved', resolvedCard(card))) queueFull = true;
     }
     if (!stopped) store.purgeResolved();
     if (queueFull) log('pending delivery queue is full');
