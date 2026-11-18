@@ -18,7 +18,7 @@ import { createMissionFacade, createRosterFacade, createSpawnQuota, createTaskFa
 import { mountMissionTools } from './mission-tools.js';
 import { createPendingWatcher } from './pending.js';
 import { createResponse, createRouter } from './router.js';
-import { readPendingInterval, resolveWebhookConfig } from './webhook.js';
+import { readPendingInterval, resolveWebhookConfig, webhookSecretNeedles } from './webhook.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HOST_MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
@@ -226,7 +226,7 @@ export async function startStandalone(options = {}) {
     sleep: options.sleep,
     now,
     log(message) {
-      const needles = webhook ? [webhook.secret] : [];
+      const needles = webhook ? webhookSecretNeedles(webhook.secret) : [];
       const scrubbed = client.scrub(scrubValue(message, needles));
       ctx.log.warn(typeof scrubbed === 'string' ? scrubbed : 'pending');
     },

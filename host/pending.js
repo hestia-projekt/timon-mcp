@@ -14,6 +14,12 @@
  * `DELIVERY_CONCURRENCY` deliveries run at once, and at most
  * `DELIVERY_QUEUE_CAP` are outstanding. Resolved rows are kept up to
  * `RESOLVED_ROW_CAP`; the oldest are deleted past that.
+ * Each sent occurrence uses `webhook-id` `<event>_<card id>_<n>`. `n` is
+ * the next count in `host_pending_webhook_seq` for that card and event.
+ * The count is written only when the occurrence is recorded, in the same
+ * transaction as the card row, so retries and a restart before the record
+ * keep it. The next record of that event uses the next count. Purging a
+ * resolved card row does not delete the count.
  * A card `projectCard` refuses stays seen for that pass. The host logs the
  * id only. `resolved` is emitted only when the id is absent from the list.
  */
@@ -55,7 +61,21 @@ function isPlain(value) {
 }
 
 /**
- * @param {{ prepare: Function }} sql
+ * @param {unknown} raw
+ * @returns {number}
+ */
+function readSeq(raw) {
+  if (typeof raw === 'bigint') {
+    if (raw < 0n || raw > BigInt(Number.MAX_SAFE_INTEGER)) return 0;
+    return Number(raw);
+  }
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0) return 0;
+  return n;
+}
+
+/**
+ * @param {{ prepare: Function, transaction?: Function }} sql
  */
 function createStore(sql) {
   const one = sql.prepare('SELECT id, event, projection FROM host_pending_cards WHERE id = ?');
@@ -70,13 +90,21 @@ function createStore(sql) {
       LIMIT ?
     )
   `);
-  const save = sql.prepare(`
+  const saveCard = sql.prepare(`
     INSERT INTO host_pending_cards (id, event, projection, updated_at)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       event = excluded.event,
       projection = excluded.projection,
       updated_at = excluded.updated_at
+  `);
+  const seqRow = sql.prepare('SELECT pending_seq, resolved_seq FROM host_pending_webhook_seq WHERE id = ?');
+  const saveSeq = sql.prepare(`
+    INSERT INTO host_pending_webhook_seq (id, pending_seq, resolved_seq)
+    VALUES (?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      pending_seq = excluded.pending_seq,
+      resolved_seq = excluded.resolved_seq
   `);
   return {
     /**
@@ -89,13 +117,51 @@ function createStore(sql) {
       return open.all();
     },
     /**
+     * Next occurrence of `event` for this card, and the counts to store
+     * once that occurrence is recorded. A missing row counts as zero.
+     * Nothing is written here: a restart before the record recomputes it.
+     * @param {string} id
+     * @param {'pending' | 'resolved'} event
+     * @returns {{ occurrence: number, seqs: { pending: number, resolved: number } }}
+     */
+    nextSeqs(id, event) {
+      const row = seqRow.get(id);
+      const pending = readSeq(row && row.pending_seq);
+      const resolved = readSeq(row && row.resolved_seq);
+      const occurrence = (event === 'pending' ? pending : resolved) + 1;
+      return {
+        occurrence,
+        seqs: {
+          pending: event === 'pending' ? occurrence : pending,
+          resolved: event === 'resolved' ? occurrence : resolved,
+        },
+      };
+    },
+    /**
      * @param {string} id
      * @param {'pending' | 'resolved'} event
      * @param {Record<string, unknown>} card
      * @param {number} now
      */
     save(id, event, card, now) {
-      save.run(id, event, JSON.stringify(card), now);
+      saveCard.run(id, event, JSON.stringify(card), now);
+    },
+    /**
+     * Card row and occurrence counts commit together. The count is the one
+     * `nextSeqs` already handed to this delivery, not a new increment.
+     * @param {string} id
+     * @param {'pending' | 'resolved'} event
+     * @param {Record<string, unknown>} card
+     * @param {number} now
+     * @param {{ pending: number, resolved: number }} seqs
+     */
+    saveOccurrence(id, event, card, now, seqs) {
+      const write = () => {
+        saveCard.run(id, event, JSON.stringify(card), now);
+        saveSeq.run(id, seqs.pending, seqs.resolved);
+      };
+      if (typeof sql.transaction === 'function') sql.transaction(write);
+      else write();
     },
     purgeResolved() {
       const row = countResolved.get();
@@ -137,7 +203,7 @@ export function createPendingWatcher(options) {
   let chain = Promise.resolve();
   let stopped = false;
   let busy = false;
-  /** @type {Array<{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string }>} */
+  /** @type {Array<{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string, occurrence: number, seqs: { pending: number, resolved: number } }>} */
   const queue = [];
   /** Keys of jobs that are queued or in flight. */
   const inflight = new Set();
@@ -177,16 +243,18 @@ export function createPendingWatcher(options) {
   /**
    * @param {'pending' | 'resolved'} event
    * @param {Record<string, unknown>} card
+   * @param {number} occurrence
+   * @param {{ pending: number, resolved: number }} seqs
    * @returns {boolean} `false` when the global ceiling refused the job.
    */
-  function acceptDelivery(event, card) {
+  function acceptDelivery(event, card, occurrence, seqs) {
     const id = String(card.id);
     const key = `${event}:${id}`;
     if (inflight.has(key)) return true;
     if (outstanding >= DELIVERY_QUEUE_CAP) return false;
     inflight.add(key);
     noteQueued();
-    queue.push({ event, card, id, key });
+    queue.push({ event, card, id, key, occurrence, seqs });
     pump();
     return true;
   }
@@ -201,11 +269,11 @@ export function createPendingWatcher(options) {
   }
 
   /**
-   * @param {{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string }} job
+   * @param {{ event: 'pending' | 'resolved', card: Record<string, unknown>, id: string, key: string, occurrence: number, seqs: { pending: number, resolved: number } }} job
    */
   async function runDelivery(job) {
     try {
-      if (!stopped) await emit(job.event, job.card);
+      if (!stopped) await emit(job.event, job.card, job.occurrence);
     } catch {
       /* deliverWebhook already bounds its own failures */
     } finally {
@@ -213,7 +281,7 @@ export function createPendingWatcher(options) {
     }
     if (!stopped) {
       try {
-        store.save(job.id, job.event, job.card, now());
+        store.saveOccurrence(job.id, job.event, job.card, now(), job.seqs);
         if (job.event === 'resolved') store.purgeResolved();
       } catch {
         log(`pending card record failed id=${job.id}`);
@@ -267,14 +335,16 @@ export function createPendingWatcher(options) {
   /**
    * @param {'pending' | 'resolved'} event
    * @param {Record<string, unknown>} card
+   * @param {number} occurrence
    */
-  async function emit(event, card) {
+  async function emit(event, card, occurrence) {
     if (!webhook) return true;
     return deliverWebhook({
       url: webhook.url,
       secret: webhook.secret,
       event,
       card,
+      occurrence,
       sleep,
       log,
       now,
@@ -287,12 +357,16 @@ export function createPendingWatcher(options) {
    * @returns {boolean} `false` when the job did not fit and was not recorded.
    */
   function recordOrEnqueue(event, card) {
+    const id = String(card.id);
     if (!webhook) {
-      store.save(String(card.id), event, card, now());
+      store.save(id, event, card, now());
       if (event === 'resolved') store.purgeResolved();
       return true;
     }
-    return acceptDelivery(event, card);
+    // Read the count, do not write it. The write waits until this delivery
+    // is recorded, so a restart before that record sends this same id again.
+    const { occurrence, seqs } = store.nextSeqs(id, event);
+    return acceptDelivery(event, card, occurrence, seqs);
   }
 
   async function once() {

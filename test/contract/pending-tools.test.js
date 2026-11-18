@@ -94,6 +94,30 @@ test('the host refuses a non-https webhook URL and a missing secret before it li
       }),
       (err) => err.message === 'pending webhook secret is missing',
     );
+    const badTail = `${randomBytes(12).toString('base64')}*`;
+    const badSecret = `whsec_${badTail}`;
+    const unpadded = `whsec_${'abc'.repeat(6)}`;
+    const nonCanonical = `whsec_${'ab=='.repeat(4)}`;
+    for (const sample of [badSecret, unpadded, nonCanonical]) {
+      assert.ok(sample.length >= 16 && sample.length <= 512);
+      await assert.rejects(
+        () => startStandalone({
+          env: {
+            TIMON_DAEMON_URL: 'http://127.0.0.1:9',
+            TIMON_MCP_PENDING_WEBHOOK_URL: 'https://hooks.example/hook',
+            TIMON_MCP_PENDING_WEBHOOK_SECRET: sample,
+          },
+          port: 0,
+          tokenFile: join(dir, 'token'),
+          dbFile: join(dir, 'state.db'),
+          pendingPoll: false,
+        }),
+        (err) => err.message === 'pending webhook secret is not valid base64'
+          && !err.message.includes(sample)
+          && !String(err.stack || '').includes(sample)
+          && !err.message.includes(badTail),
+      );
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -355,6 +379,9 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   await stack.host.settlePending();
   assert.deepEqual(delays, [200]);
   assert.equal(receiver.requests.length, 2);
+  assert.equal(header(receiver.requests[0].headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  verifySignature(receiver.requests[0], hookSecret);
   const delivered = receiver.requests[1];
   assert.equal(delivered.url, '/hook');
   assert.equal(delivered.body.includes(cardSecret), false);
@@ -410,8 +437,198 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   assert.equal(resolved.body.includes(cardSecret), false);
   assert.equal(resolved.body.includes(hookSecret), false);
   verifySignature(resolved, hookSecret);
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}_1`);
+  assert.notEqual(header(resolved.headers, 'webhook-id'), header(delivered.headers, 'webhook-id'));
+  assertAbsent(JSON.stringify(stack.logs), [...secretMaterial(hookSecret), ...signatureMaterial(receiver.requests)]);
   assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
   assert.equal(JSON.stringify(stack.logs).includes(cardSecret), false);
+});
+
+test('a whsec_ webhook is signed again on each attempt and keeps one id per event', async (t) => {
+  const cardSecret = randomBytes(24).toString('hex');
+  const decoded = randomBytes(24).toString('hex');
+  const hookSecret = `whsec_${Buffer.from(decoded, 'utf8').toString('base64')}`;
+  assert.notEqual(cardSecret, hookSecret);
+  assert.notEqual(decoded, hookSecret);
+  let failuresLeft = 1;
+  const receiver = await startReceiver(() => {
+    if (failuresLeft > 0) {
+      failuresLeft -= 1;
+      return { status: 500 };
+    }
+    return { status: 204 };
+  });
+  t.after(() => receiver.close());
+  let tick = 0;
+  const origin = Date.now();
+  const base = origin - (origin % 1000) + 123;
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+    now: () => {
+      tick += 1;
+      return base + tick * 1000;
+    },
+  });
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 2);
+  const [first, second] = receiver.requests;
+  assert.equal(header(first.headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  assert.equal(header(second.headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  assert.notEqual(header(first.headers, 'webhook-timestamp'), header(second.headers, 'webhook-timestamp'));
+  assert.notEqual(header(first.headers, 'webhook-signature'), header(second.headers, 'webhook-signature'));
+  assert.notEqual(header(first.headers, 'x-timon-timestamp'), header(second.headers, 'x-timon-timestamp'));
+  for (const request of [first, second]) {
+    verifySignature(request, hookSecret);
+    assert.equal(Number(header(request.headers, 'x-timon-timestamp')) % 1000, 123);
+  }
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 3);
+  const resolved = receiver.requests[2];
+  assert.equal(JSON.parse(resolved.body).event, 'resolved');
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}_1`);
+  assert.notEqual(header(resolved.headers, 'webhook-id'), header(first.headers, 'webhook-id'));
+  verifySignature(resolved, hookSecret);
+
+  const leaked = [
+    ...secretMaterial(hookSecret),
+    decoded,
+    ...signatureMaterial(receiver.requests),
+  ];
+  assertAbsent(JSON.stringify(stack.logs), leaked);
+  assertAbsent(JSON.stringify(stack.journal), leaked);
+  for (const request of receiver.requests) {
+    assert.equal(request.body.includes(hookSecret), false);
+    assert.equal(request.body.includes(decoded), false);
+    assert.equal(request.body.includes(cardSecret), false);
+  }
+});
+
+test('a later occurrence gets a new webhook id, and a restart reuses an unrecorded one', async (t) => {
+  const cardSecret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  let release = () => {};
+  let hold = false;
+  const receiver = await startReceiver(() => {
+    if (!hold) return { status: 204 };
+    return new Promise((resolve) => {
+      release = () => resolve({ status: 204 });
+    });
+  });
+  t.after(() => receiver.close());
+  const env = {
+    TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+    TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+  };
+  const stack = await openStack(t, { env, sleep: async () => {} });
+  /** @type {Awaited<ReturnType<typeof startStandalone>> | null} */
+  let extra = null;
+  t.after(async () => {
+    if (extra) await extra.close();
+  });
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  hold = true;
+  await stack.host.pollPending();
+  await waitUntil(() => receiver.requests.length === 1, 1000);
+  const pendingFirst = header(receiver.requests[0].headers, 'webhook-id');
+  assert.equal(pendingFirst, `pending_${APPROVAL_ID}_1`);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_pending_cards WHERE id = ?').get(APPROVAL_ID), undefined);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_pending_webhook_seq WHERE id = ?').get(APPROVAL_ID), undefined);
+
+  const closing = stack.host.close();
+  release();
+  hold = false;
+  await closing;
+
+  extra = await startStandalone({
+    port: 0,
+    daemonUrl: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    dbFile: stack.dbFile,
+    env: { [BEARER_SECRET]: stack.bearer, ...env },
+    pendingPoll: false,
+    sleep: async () => {},
+    journal: [],
+    logs: [],
+  });
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 2);
+  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), pendingFirst);
+  verifySignature(receiver.requests[0], hookSecret);
+  verifySignature(receiver.requests[1], hookSecret);
+  const recorded = extra.ctx.sql.prepare(
+    'SELECT c.event AS event, s.pending_seq AS pending_seq, s.resolved_seq AS resolved_seq FROM host_pending_cards AS c JOIN host_pending_webhook_seq AS s ON s.id = c.id WHERE c.id = ?',
+  ).get(APPROVAL_ID);
+  assert.equal(recorded.event, 'pending');
+  assert.equal(Number(recorded.pending_seq), 1);
+  assert.equal(Number(recorded.resolved_seq), 0);
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 3);
+  const resolvedFirst = header(receiver.requests[2].headers, 'webhook-id');
+  assert.equal(resolvedFirst, `resolved_${APPROVAL_ID}_1`);
+  verifySignature(receiver.requests[2], hookSecret);
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 4);
+  const pendingSecond = header(receiver.requests[3].headers, 'webhook-id');
+  assert.equal(pendingSecond, `pending_${APPROVAL_ID}_2`);
+  verifySignature(receiver.requests[3], hookSecret);
+  assert.equal(new Set([pendingFirst, resolvedFirst, pendingSecond]).size, 3);
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 5);
+  const resolvedSecond = header(receiver.requests[4].headers, 'webhook-id');
+  assert.equal(resolvedSecond, `resolved_${APPROVAL_ID}_2`);
+  assert.notEqual(resolvedSecond, resolvedFirst);
+  verifySignature(receiver.requests[4], hookSecret);
+
+  extra.ctx.sql.prepare('UPDATE host_pending_cards SET updated_at = 0 WHERE id = ?').run(APPROVAL_ID);
+  const insert = extra.ctx.sql.prepare(
+    'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
+  );
+  for (let i = 0; i < RESOLVED_ROW_CAP; i += 1) {
+    const id = `88888888-8888-4888-8888-${String(i).padStart(12, '0')}`;
+    insert.run(id, 'resolved', JSON.stringify({ id }), i + 1);
+  }
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 5, 'purging a resolved row does not send it again');
+  assert.equal(extra.ctx.sql.prepare('SELECT id FROM host_pending_cards WHERE id = ?').get(APPROVAL_ID), undefined);
+  const kept = extra.ctx.sql.prepare(
+    'SELECT pending_seq, resolved_seq FROM host_pending_webhook_seq WHERE id = ?',
+  ).get(APPROVAL_ID);
+  assert.equal(Number(kept.pending_seq), 2);
+  assert.equal(Number(kept.resolved_seq), 2);
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 6);
+  assert.equal(header(receiver.requests[5].headers, 'webhook-id'), `pending_${APPROVAL_ID}_3`);
+  verifySignature(receiver.requests[5], hookSecret);
+  for (const request of receiver.requests) {
+    assert.equal(request.body.includes(cardSecret), false);
+    assert.equal(request.body.includes(hookSecret), false);
+    assert.match(header(request.headers, 'x-timon-signature'), /^v1=/);
+    assert.match(header(request.headers, 'webhook-signature'), /^v1,/);
+  }
 });
 
 test('a refused webhook is abandoned after three tries and a redirect is not followed', async (t) => {
@@ -580,7 +797,12 @@ test('resolved rows stay bounded and a busy poll ignores the next tick', async (
       event TEXT NOT NULL CHECK (event IN ('pending', 'resolved')),
       projection TEXT NOT NULL,
       updated_at INTEGER NOT NULL
-    )
+    );
+    CREATE TABLE host_pending_webhook_seq (
+      id TEXT PRIMARY KEY,
+      pending_seq INTEGER NOT NULL DEFAULT 0,
+      resolved_seq INTEGER NOT NULL DEFAULT 0
+    );
   `);
   const insert = db.prepare(
     'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
@@ -825,6 +1047,77 @@ function verifySignature(request, secret) {
   assert.equal(left.length, right.length);
   assert.equal(timingSafeEqual(left, right), true);
   assert.equal(request.body.includes(secret), false);
+  verifyStandardWebhook(request, secret);
+}
+
+/**
+ * Standard Webhooks check, written here and not imported from the host.
+ * A `whsec_` secret uses the decoded payload. Any other secret is UTF-8.
+ * @param {{ headers: Record<string, string | string[] | undefined>, body: string }} request
+ * @param {string} secret
+ */
+function verifyStandardWebhook(request, secret) {
+  const id = header(request.headers, 'webhook-id');
+  const timestamp = header(request.headers, 'webhook-timestamp');
+  const signature = header(request.headers, 'webhook-signature');
+  const millis = header(request.headers, 'x-timon-timestamp');
+  assert.match(id, /^[A-Za-z0-9._-]+$/);
+  assert.match(timestamp, /^[0-9]+$/);
+  assert.equal(timestamp, String(Math.floor(Number(millis) / 1000)));
+  assert.notEqual(timestamp, millis);
+  const key = secret.startsWith('whsec_')
+    ? Buffer.from(secret.slice('whsec_'.length), 'base64')
+    : Buffer.from(secret, 'utf8');
+  const expected = createHmac('sha256', key).update(`${id}.${timestamp}.${request.body}`).digest('base64');
+  const got = signature.startsWith('v1,') ? signature.slice(3) : '';
+  const left = Buffer.from(expected);
+  const right = Buffer.from(got);
+  assert.equal(left.length, right.length);
+  assert.equal(left.length > 0, true);
+  assert.equal(timingSafeEqual(left, right), true);
+}
+
+/**
+ * @param {string} secret
+ */
+function secretMaterial(secret) {
+  /** @type {string[]} */
+  const values = [secret];
+  if (secret.startsWith('whsec_')) {
+    const encoded = secret.slice('whsec_'.length);
+    values.push(encoded);
+    const key = Buffer.from(encoded, 'base64');
+    const utf8 = key.toString('utf8');
+    if (Buffer.from(utf8, 'utf8').equals(key)) values.push(utf8);
+    values.push(key.toString('hex'));
+  }
+  return values;
+}
+
+/**
+ * @param {Array<{ headers: Record<string, string | string[] | undefined> }>} requests
+ */
+function signatureMaterial(requests) {
+  /** @type {string[]} */
+  const values = [];
+  for (const request of requests) {
+    const standard = header(request.headers, 'webhook-signature');
+    const legacy = header(request.headers, 'x-timon-signature');
+    if (standard.startsWith('v1,')) values.push(standard.slice(3), standard);
+    if (legacy.startsWith('v1=')) values.push(legacy.slice(3), legacy);
+  }
+  return values;
+}
+
+/**
+ * @param {string} text
+ * @param {string[]} values
+ */
+function assertAbsent(text, values) {
+  for (const value of values) {
+    if (value.length < 8) continue;
+    assert.equal(text.includes(value), false);
+  }
 }
 
 /**
