@@ -19,6 +19,7 @@ import {
   isAutomationId,
   isProject,
   isWorkflowId,
+  shownAgent,
 } from './names.js';
 
 const LIST_DEFAULT = 50;
@@ -365,7 +366,7 @@ function projectStep(step) {
   if (step.id.includes('..')) return null;
   return {
     id: step.id,
-    agent: asLabel(step.agent),
+    agent: shownAgent(step.agent),
     type: typeof step.type === 'string' && step.type.length <= 64 ? step.type : null,
     deps_on: stringList(step.deps_on, 64),
     priority: Number.isInteger(step.priority) ? step.priority : null,
@@ -441,7 +442,7 @@ function projectStatusStep(step) {
     step_id: step.step_id.slice(0, 64),
     task_id: step.task_id.slice(0, 200),
     title: asLabel(step.title),
-    agent: asLabel(step.agent),
+    agent: shownAgent(step.agent),
     type: typeof step.type === 'string' && step.type.length <= 64 ? step.type : null,
     status: asShort(step.status),
     mission_id: isAutomationId(step.mission_id) ? step.mission_id : null,
@@ -601,9 +602,7 @@ function asLabel(value) {
  * @returns {string | null}
  */
 function asAgent(value) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 200) return null;
-  if (value.includes('/') || value.includes('..')) return null;
-  return value;
+  return shownAgent(value);
 }
 
 /**

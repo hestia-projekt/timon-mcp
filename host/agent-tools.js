@@ -9,9 +9,10 @@
  * and counts against the spawn window. Kind `msg` does not.
  */
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
-import { MESSAGE_KIND_NAMES, NAMED_AGENT, PROJECT_NAME } from './names.js';
+import { AGENT_NAME_MAX, AGENT_PATH, AGENT_READ_MAX, MESSAGE_KIND_NAMES, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
-const agentName = { type: 'string', pattern: NAMED_AGENT.source };
+const namedAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: NAMED_AGENT.source };
+const readAgent = { type: 'string', maxLength: AGENT_READ_MAX, pattern: AGENT_PATH.source };
 const projectName = { type: 'string', pattern: PROJECT_NAME.source };
 const limit = { type: 'integer', minimum: 1, maximum: 100 };
 
@@ -51,7 +52,7 @@ export const ROSTER_TOOLS = [
   {
     name: 'list_agents',
     ...schema(
-      'Lists agents on this Timon: name, role, project, and whether the agent is an orchestrator. Optional project filters after the read. The system prompt, privileged config, MCP servers, secrets, and skills are not returned. At most 100. No query is sent.',
+      'Lists agents on this Timon, including an ephemeral `_eph-…`: name, role, project, and whether the agent is an orchestrator. Optional project filters after the read. The system prompt, privileged config, MCP servers, secrets, and skills are not returned. At most 100. No query is sent.',
       { project: projectName, limit },
     ),
     /**
@@ -66,8 +67,8 @@ export const ROSTER_TOOLS = [
   {
     name: 'get_agent',
     ...schema(
-      'Reads one existing agent (`_main` or `<project>.<role>`): name, role, project, orchestrator, reports_to, and ephemeral. The system prompt, privileged config, MCP servers, secrets, and skills are not returned.',
-      { agent: agentName },
+      'Reads one agent by a path-safe display name, including an ephemeral `_eph-…`: name, role, project, orchestrator, reports_to, and ephemeral. `.`, `..`, a percent-encoding, and the route words active, spawn, ephemeral, and main are refused. The system prompt, privileged config, MCP servers, secrets, and skills are not returned.',
+      { agent: readAgent },
       ['agent'],
     ),
     /**
@@ -83,7 +84,7 @@ export const ROSTER_TOOLS = [
     ...schema(
       'Sends a direct message to an agent that already exists (`_main` or `<project>.<role>`). The host sets from_mission and from_agent; those fields are not parameters. kind is msg (default, does not wake, does not count against the host spawn window) or request (wakes the recipient and counts against the window). The message is at most 20,000 characters and must not be a work return. No agent, file, skill, MCP server, or project is written.',
       {
-        agent: agentName,
+        agent: namedAgent,
         message: { type: 'string', minLength: 1, maxLength: MESSAGE_MAX_CHARS },
         kind: { type: 'string', enum: [...MESSAGE_KIND_NAMES] },
       },

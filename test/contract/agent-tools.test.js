@@ -26,11 +26,15 @@ const PROJECTS = [
   { slug: 'beta', name: 'Beta', status: 'paused' },
 ];
 
+const EPH = '_eph-7f3a9c1e';
+
 const AGENTS = [
+  { name: EPH, role: 'coder', project: null, orchestrator: false },
   { name: '_main', role: 'orchestrator', project: null, orchestrator: true },
   { name: 'alpha.coder', role: 'coder', project: 'alpha', orchestrator: false },
   { name: 'alpha.orchestrator', role: 'orchestrator', project: 'alpha', orchestrator: true },
   { name: 'beta.reviewer', role: 'reviewer', project: null, orchestrator: false },
+  { name: 'not-named', role: 'coder', project: 'alpha', orchestrator: false },
 ];
 
 test('project and agent tools project the fake daemon and fix the sender', async (t) => {
@@ -58,8 +62,9 @@ test('project and agent tools project the fake daemon and fix the sender', async
 
   const filtered = await call(stack, 'list_agents', { project: 'alpha' });
   assert.deepEqual(filtered.body.result.structuredContent.agents, [
-    AGENTS[1],
     AGENTS[2],
+    AGENTS[3],
+    AGENTS[5],
   ]);
   assert.equal(stack.daemon.requests.at(-1).search, '');
 
@@ -162,6 +167,12 @@ test('roster routes, queries, encoded paths, and a caller from_* never reach the
     ['GET', '/api/agents/ab%2fcd'],
     ['GET', '/api/agents/../projects'],
     ['GET', '/api/agents/%2e%2e'],
+    ['GET', '/api/agents/.'],
+    ['GET', '/api/agents/..'],
+    ['GET', '/api/agents/foo..bar'],
+    ['GET', '/api/agents/ephemeral'],
+    ['GET', '/api/agents/spawn'],
+    ['GET', '/api/agents/main'],
     ['GET', '/api/messages'],
     ['POST', '/api/messages/abc/pick'],
   ];
@@ -246,8 +257,15 @@ test('roster routes, queries, encoded paths, and a caller from_* never reach the
     ['send_agent', { agent: 'alpha.coder', message: 'hi', in_reply_to: '1' }],
     ['send_agent', { agent: 'active', message: 'hi' }],
     ['send_agent', { agent: 'not-named', message: 'hi' }],
+    ['send_agent', { agent: EPH, message: 'hi' }],
     ['get_agent', { agent: 'active' }],
-    ['get_agent', { agent: 'not-named' }],
+    ['get_agent', { agent: 'spawn' }],
+    ['get_agent', { agent: 'ephemeral' }],
+    ['get_agent', { agent: 'main' }],
+    ['get_agent', { agent: '.' }],
+    ['get_agent', { agent: '..' }],
+    ['get_agent', { agent: '%2f' }],
+    ['get_agent', { agent: 'foo..bar' }],
     ['list_agents', { project: '/secret/alpha' }],
     ['list_projects', { cwd: '/secret/alpha' }],
   ];
@@ -348,6 +366,53 @@ test('a request to a missing agent still takes a spawn slot', async (t) => {
   const note = await call(stack, 'send_agent', { agent: 'alpha.coder', message: 'note' });
   assert.equal(note.body.result.isError, false);
   assert.equal(stack.daemon.requests.length, after + 1);
+});
+
+test('an ephemeral agent is listed and readable, and a launch name is not', async (t) => {
+  const stack = await openStack(t);
+  const client = createDaemonClient({
+    origin: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    env: { [BEARER_SECRET]: stack.bearer },
+    bearerName: BEARER_SECRET,
+  });
+
+  const listed = await call(stack, 'list_agents', {});
+  assert.equal(listed.body.result.structuredContent.agents.some((row) => row.name === EPH), true);
+  assertNoNeedle(listed.text);
+
+  const detail = await call(stack, 'get_agent', { agent: EPH });
+  assert.equal(detail.body.result.isError, false);
+  assert.deepEqual(detail.body.result.structuredContent, {
+    name: EPH,
+    role: 'coder',
+    project: null,
+    orchestrator: false,
+    reports_to: null,
+    ephemeral: true,
+  });
+  assert.equal(stack.daemon.requests.at(-1).path, `/api/agents/${EPH}`);
+  assertNoNeedle(detail.text);
+
+  const display = await call(stack, 'get_agent', { agent: 'not-named' });
+  assert.equal(display.body.result.isError, false);
+  assert.equal(display.body.result.structuredContent.reports_to, EPH);
+  assert.equal(display.body.result.structuredContent.ephemeral, false);
+  assert.equal(display.text.includes('LEAKED NAME PROMPT'), false);
+  assert.equal(display.text.includes('SECRET SYSTEM PROMPT'), false);
+
+  const read = await client.request('GET', `/api/agents/${EPH}`);
+  assert.equal(read.status, 200);
+  await assert.rejects(
+    () => client.request('POST', '/api/messages', {
+      to_agent: EPH,
+      payload: 'hello',
+      kind: 'msg',
+      from_mission: DIRECT_FROM_MISSION,
+      from_agent: DIRECT_FROM_AGENT,
+    }),
+    (err) => err.code === 'route_denied',
+  );
 });
 
 /**

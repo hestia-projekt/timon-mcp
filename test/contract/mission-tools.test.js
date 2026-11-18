@@ -278,6 +278,20 @@ test('overrides, bad ids, and fields outside the list never reach the daemon', a
     ['launch_mission', { agent: '_main', message: 'x', permissionMode: 'auto' }],
     ['launch_mission', { agent: 'other', message: 'x' }],
     ['launch_mission', { agent: 'alpha.coder.extra', message: 'x' }],
+    ['launch_mission', { agent: '_eph-7f3a9c1e', message: 'x' }],
+    ['stop_scope', { agent: '.' }],
+    ['stop_scope', { agent: '..' }],
+    ['stop_scope', { agent: '%2f' }],
+    ['stop_scope', { agent: 'active' }],
+    ['stop_scope', { agent: 'spawn' }],
+    ['stop_scope', { agent: 'ephemeral' }],
+    ['stop_scope', { agent: 'main' }],
+    ['stop_scope', { agent: 'foo..bar' }],
+    ['list_all_missions', { agent: '..' }],
+    ['list_all_missions', { agent: '.' }],
+    ['list_all_missions', { agent: '%2f' }],
+    ['list_all_missions', { agent: 'active' }],
+    ['list_all_missions', { agent: '../secret' }],
     ['steer_mission', { mission_id: 'foreignmission01', message: 'x', images: [] }],
     ['send_mission', { mission_id: 'foreignmission01', message: 'x', reply_to: { event_id: 1 } }],
     ['stop_scope', { agent: '_main', note: 'x' }],
@@ -340,6 +354,61 @@ test('launch, send, steer, and both stops share the quota; reads and interrupt d
   assert.equal(state.body.result.isError, false);
   assert.equal(stack.daemon.requests.length, afterLaunch + 3);
   assert.equal(stack.daemon.requests.slice(afterLaunch).some((row) => row.method === 'POST' && row.path === '/api/missions'), false);
+});
+
+test('an ephemeral agent filters missions and stops, and a path is not copied out', async (t) => {
+  const stack = await openStack(t, { env: { TIMON_MCP_SPAWN_MAX: '5' } });
+  const client = createDaemonClient({
+    origin: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    env: { [BEARER_SECRET]: stack.bearer },
+    bearerName: BEARER_SECRET,
+  });
+  const eph = '_eph-7f3a9c1e';
+
+  const listed = await call(stack, 'list_all_missions', { agent: eph });
+  assert.equal(listed.body.result.isError, false);
+  assert.deepEqual(
+    listed.body.result.structuredContent.missions.map((row) => row.id),
+    ['ephmission01'],
+  );
+  assert.equal(listed.body.result.structuredContent.missions[0].agent_name, eph);
+  assert.equal(stack.daemon.requests.at(-1).search, `?agent=${eph}&limit=50`);
+
+  const state = await call(stack, 'get_mission_state', { mission_id: 'ephmission01' });
+  assert.equal(state.body.result.structuredContent.agent_name, eph);
+  assert.equal(state.body.result.structuredContent.parent_agent, eph);
+
+  const hidden = await call(stack, 'get_mission_state', { mission_id: 'badagentmis01' });
+  assert.equal(hidden.body.result.structuredContent.agent_name, null);
+  assert.equal(hidden.body.result.structuredContent.parent_agent, null);
+  assert.equal(hidden.body.result.structuredContent.children[0].agent_name, null);
+  assert.equal(hidden.text.includes('../secret'), false);
+
+  const stopped = await call(stack, 'stop_scope', { agent: eph });
+  assert.equal(stopped.body.result.isError, false);
+  assert.deepEqual(stopped.body.result.structuredContent.scope, { kind: 'agent', name: eph });
+  assert.deepEqual(stopped.body.result.structuredContent.agents, [eph]);
+  const stopCall = stack.daemon.requests.find((row) => row.bodyText === `{"agent":"${eph}"}`);
+  assert.equal(stopCall.method, 'POST');
+  assert.equal(stopCall.path, '/api/stop');
+
+  const allowed = await client.request('GET', '/api/missions', undefined, { agent: eph, limit: '1' });
+  assert.equal(allowed.status, 200);
+  const stoppedDirect = await client.request('POST', '/api/stop', { agent: eph });
+  assert.equal(stoppedDirect.status, 200);
+  await assert.rejects(
+    () => client.request('POST', '/api/stop', { agent: '..' }),
+    (err) => err.code === 'route_denied',
+  );
+  await assert.rejects(
+    () => client.request('GET', '/api/missions', undefined, { agent: 'active' }),
+    (err) => err.code === 'route_denied',
+  );
+
+  const launched = await call(stack, 'launch_mission', { agent: eph, message: 'no' });
+  assert.equal(launched.body.result, undefined);
+  assert.equal(launched.body.error.code, -32602);
 });
 
 /**

@@ -11,10 +11,41 @@ const PROJECT_BODY = PROJECT_PATTERN.slice(1, -1);
 export const PROJECT_NAME = new RegExp(`^${PROJECT_BODY}$`);
 
 /**
+ * Longest agent name release 0.1.8 fabricates. Not a length the daemon accepts.
+ *
+ * `validName` (`agent-config.js` `NAME_RE`, `/^[A-Za-z0-9._-]+$/`) states no
+ * length. `POST /api/agents` and `renameAgentLocked` apply only that check.
+ * The plugin facade `NameSchema` (`plugins/agents-facade.js`) caps a write at
+ * 100. A name already stored can be longer than either write path.
+ *
+ * What those rules fabricate is shorter. A project slug is 1..64
+ * (`projects.js` `SLUG_RE`) and a role id is 2..32 (`agent-roles.js` `ID_RE`,
+ * one letter then `{1,31}`), so `<slug>.<role>` (`agent-seed.js`) is 97
+ * characters. An ephemeral name is `_eph-` plus a hint of at most 24 plus `-`
+ * plus 8 hex (`createEphemeralAgent`), which is 38. 97 is that fabricated
+ * ceiling. A read uses `AGENT_READ_MAX`. A launch uses `NAMED_AGENT`.
+ */
+const DAEMON_CANONICAL_MAX = 64 + 1 + 32;
+const DAEMON_EPHEMERAL_MAX = 5 + 24 + 1 + 8;
+export const AGENT_NAME_MAX = Math.max(DAEMON_CANONICAL_MAX, DAEMON_EPHEMERAL_MAX);
+
+/**
+ * Longest name a read will copy or place on a path.
+ * The daemon's hard bound is that the name is one directory (`agentDir`),
+ * so `NAME_MAX` is 255. `.`, `..`, and the route words stay refused on a path.
+ */
+export const AGENT_READ_MAX = 255;
+
+/**
  * An agent the operator already has: the pilot `_main`, or `<project>.<role>`.
  * One dot. The host does not create the agent.
+ * `PROJECT_PATTERN` is 1..40 characters, so `<project>.<role>` is at most 81
+ * and `_main` is 5. The pattern is the ceiling. A length lookahead would only
+ * repeat it, and 97 is the fabricated name, not this one.
  */
-export const NAMED_AGENT = new RegExp(`^(?:${PILOT_AGENT}|${PROJECT_BODY}\\.${PROJECT_BODY})$`);
+export const NAMED_AGENT = new RegExp(
+  `^(?:${PILOT_AGENT}|${PROJECT_BODY}\\.${PROJECT_BODY})$`,
+);
 
 /** Mission ids this host will place in a path. Dots are out: they are route words. */
 export const MISSION_ID = /^[A-Za-z0-9_-]{1,200}$/;
@@ -117,19 +148,57 @@ export function isNamedAgent(value) {
 }
 
 /**
- * An agent name the daemon will show on a card.
- * Release 0.1.8 `validName` in `agent-config.js` is `/^[A-Za-z0-9._-]+$/`.
- * This host keeps that shape and caps it at 80 characters. An ephemeral id
- * (`_eph-…`) matches. This is not a name the host will place on a path:
- * that stays `isNamedAgent`.
+ * An agent name the daemon will show.
+ * Same characters as release 0.1.8 `validName`, which states no length.
+ * The cap is `AGENT_READ_MAX`: one directory (`agentDir`). An ephemeral id
+ * (`_eph-…`) matches, and so does a stored name longer than the 100-character
+ * plugin facade. A launch or a direct message stays `isNamedAgent`. A name
+ * this host places on a path uses `isAgentPath`.
  */
-export const DISPLAY_AGENT = /^[A-Za-z0-9._-]{1,80}$/;
+const AGENT_CHARS = `[A-Za-z0-9._-]{1,${AGENT_READ_MAX}}`;
+export const DISPLAY_AGENT = new RegExp(`^${AGENT_CHARS}$`);
 
 /**
  * @param {unknown} value
  */
 export function isDisplayAgent(value) {
   return typeof value === 'string' && DISPLAY_AGENT.test(value);
+}
+
+/**
+ * A display name safe to send on a read.
+ * `GET /api/agents/:name` in release 0.1.8 calls `getAgent`, which accepts
+ * `validName` and returns an ephemeral agent. The same check is used for a
+ * list filter and for `stop_scope`, so a dangerous token is refused before
+ * it can be placed on a path: `.` alone, a name that contains `..`, a
+ * percent-encoding (`%` is outside the display grammar, so `%2f` fails),
+ * and the route words `active`, `spawn`, `ephemeral`, and `main`.
+ * The length is `AGENT_READ_MAX`, the same ceiling as `isDisplayAgent`.
+ */
+export const AGENT_PATH = new RegExp(
+  `^(?!(?:active|spawn|ephemeral|main)$)(?!\\.$)(?!.*\\.\\.)${AGENT_CHARS}$`,
+);
+
+/**
+ * @param {unknown} value
+ */
+export function isAgentPath(value) {
+  return typeof value === 'string' && AGENT_PATH.test(value);
+}
+
+/**
+ * A display name copied out of a daemon row.
+ * `_eph-…` is kept. `.` and a name that contains `..` are not: they are
+ * paths, not labels. A reserved route word is kept when the daemon sent it,
+ * because a projection does not place the name on a path. `get_agent`
+ * still refuses that word.
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function shownAgent(value) {
+  if (!isDisplayAgent(value)) return null;
+  if (value === '.' || value.includes('..')) return null;
+  return value;
 }
 
 /**

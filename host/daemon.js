@@ -20,9 +20,11 @@ import {
   LIST_LIMIT,
   LIST_STATUS,
   MESSAGE_KIND_NAMES,
+  AGENT_PATH,
   MISSION_ID,
   NAMED_AGENT,
   PROJECT_NAME,
+  isAgentPath,
   RESERVED_AGENT_WORDS,
   RESERVED_MISSION_IDS,
   RESERVED_WORKFLOW_IDS,
@@ -99,7 +101,7 @@ export function automationTooLarge(method, path) {
 
 const ID_SEGMENT = MISSION_ID.source.slice(1, -1);
 const EVENT_SEGMENT = EVENT_ID.source.slice(1, -1);
-const AGENT_SEGMENT = NAMED_AGENT.source.slice(1, -1);
+const AGENT_SEGMENT = AGENT_PATH.source.slice(1, -1);
 const AUTO_SEGMENT = AUTOMATION_ID.source.slice(1, -1);
 const CARD_SEGMENT = CARD_ID.source.slice(1, -1);
 
@@ -210,8 +212,9 @@ export const DAEMON_ROUTES = Object.freeze([
     path: '/api/agents',
   }),
   Object.freeze({
-    // `:name` is `_main` or `<project>.<role>`. `active`, `spawn`, `ephemeral`,
-    // and `main` are their own daemon routes and never match this pattern.
+    // `:name` is a path-safe display name, including `_eph-…`.
+    // `active`, `spawn`, `ephemeral`, and `main` are their own daemon routes
+    // and never match this pattern. `.` and `..` do not either.
     name: 'agents.get',
     method: 'GET',
     path: '/api/agents/:name',
@@ -563,7 +566,7 @@ function queryString(route, method, path, query) {
 function queryValueOk(route, key, value) {
   if (typeof value !== 'string' || value !== value.trim()) return false;
   if (key === 'project') return PROJECT_NAME.test(value);
-  if (key === 'agent') return NAMED_AGENT.test(value);
+  if (key === 'agent') return isAgentPath(value);
   if (key === 'status') return (route.queryStatus ?? LIST_STATUS).test(value);
   if (key === 'limit') return LIST_LIMIT.test(value);
   return false;
@@ -784,7 +787,7 @@ function assertStopBody(method, path, body) {
     throw new DaemonRouteError(method, path);
   }
   const value = body[keys[0]];
-  if (keys[0] === 'agent' && !NAMED_AGENT.test(value)) throw new DaemonRouteError(method, path);
+  if (keys[0] === 'agent' && !isAgentPath(value)) throw new DaemonRouteError(method, path);
   if (keys[0] === 'project' && !PROJECT_NAME.test(value)) throw new DaemonRouteError(method, path);
 }
 
