@@ -15,7 +15,7 @@ import {
   INTERNAL_ERROR,
   INVALID_PARAMS,
   classifyMessage,
-  classifyProtocolHeader,
+  protocolHeaderRejected,
   rpcError,
   rpcResult,
 } from '../lib/mcp/jsonrpc.js';
@@ -250,7 +250,9 @@ async function handle(req, res, next, ctx) {
     next();
     return;
   }
-  if (foreignOrigin(req) || classifyProtocolHeader(header(req, 'mcp-protocol-version')) === 'unsupported' || !acceptsJson(req)) {
+  // Body was classified by `hostTarget` above. `initialize` is not a host
+  // target and falls through; the plugin applies the same header rule.
+  if (foreignOrigin(req) || protocolHeaderRejected(header(req, 'mcp-protocol-version'), target.message.method) || !acceptsJson(req)) {
     next();
     return;
   }

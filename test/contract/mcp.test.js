@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 import { apply } from '../../lib/index.js';
 import { APPROVAL_MESSAGE, BEARER_SECRET } from '../../lib/constants.js';
+import { assertHermesHandshake } from '../helpers/hermes-handshake.js';
 import {
   createFakeCtx,
   PluginMissionError,
@@ -35,6 +36,20 @@ test('initialize negotiates a supported version and answers an unknown one with 
 
   const missing = await post(ctx, rpc('initialize', { capabilities: {}, clientInfo: { name: 't', version: '0' } }));
   assert.equal(missing.json.error.code, -32602);
+});
+
+test('Hermes initialize negotiates from the body and the header applies afterwards', async (t) => {
+  const ctx = await open(t);
+  await assertHermesHandshake(async (body, headers = {}) => {
+    const sent = await post(ctx, body, headers);
+    return { status: sent.response.status, json: sent.json };
+  });
+
+  const note = await post(ctx, { jsonrpc: '2.0', method: 'notifications/initialized' }, {
+    'mcp-protocol-version': '2026-07-28',
+  });
+  assert.equal(note.response.status, 400);
+  assert.equal(note.json.error.code, -32600);
 });
 
 test('an unsupported MCP-Protocol-Version header is rejected and a session id is optional', async (t) => {
