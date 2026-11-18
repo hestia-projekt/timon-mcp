@@ -125,13 +125,19 @@ export function webhookSecretNeedles(secret) {
 }
 
 /**
- * `<event>_<card id>`. Stable for every attempt of one event.
+ * `<event>_<card id>_<occurrence>`. One occurrence, every attempt.
+ * The next occurrence of that event for the card uses the next number.
  * Control characters are dropped so the value can be a header.
  * @param {string} event
  * @param {string} cardId
+ * @param {number} occurrence
  */
-function standardWebhookId(event, cardId) {
-  return `${event}_${cardId.replace(/[\u0000-\u001f\u007f]/g, '')}`;
+function standardWebhookId(event, cardId, occurrence) {
+  const n = Number(occurrence);
+  // `0` is not a recorded occurrence. A bad count must not reuse `_1`.
+  const seq = Number.isSafeInteger(n) && n >= 1 ? String(n) : '0';
+  const safeId = cardId.replace(/[\u0000-\u001f\u007f]/g, '');
+  return `${event}_${safeId}_${seq}`;
 }
 
 /**
@@ -165,6 +171,7 @@ export function signWebhook(secret, timestamp, body) {
  * @param {string} options.secret
  * @param {'pending' | 'resolved'} options.event
  * @param {Record<string, unknown>} options.card
+ * @param {number} options.occurrence Count of this event for this card, starting at 1.
  * @param {(ms: number) => Promise<void>} options.sleep
  * @param {(message: string) => void} options.log
  * @param {() => number} [options.now]
@@ -177,7 +184,7 @@ export async function deliverWebhook(options) {
   const scrubbed = scrubValue({ event: options.event, card: options.card }, needles);
   const body = JSON.stringify(scrubbed);
   const id = typeof options.card.id === 'string' ? options.card.id : '';
-  const webhookId = standardWebhookId(options.event, id);
+  const webhookId = standardWebhookId(options.event, id, options.occurrence);
   /** @type {string[]} */
   const signatures = [];
   for (let attempt = 1; attempt <= WEBHOOK_ATTEMPTS; attempt += 1) {

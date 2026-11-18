@@ -379,8 +379,8 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   await stack.host.settlePending();
   assert.deepEqual(delays, [200]);
   assert.equal(receiver.requests.length, 2);
-  assert.equal(header(receiver.requests[0].headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
-  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  assert.equal(header(receiver.requests[0].headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
   verifySignature(receiver.requests[0], hookSecret);
   const delivered = receiver.requests[1];
   assert.equal(delivered.url, '/hook');
@@ -437,7 +437,7 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   assert.equal(resolved.body.includes(cardSecret), false);
   assert.equal(resolved.body.includes(hookSecret), false);
   verifySignature(resolved, hookSecret);
-  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}`);
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}_1`);
   assert.notEqual(header(resolved.headers, 'webhook-id'), header(delivered.headers, 'webhook-id'));
   assertAbsent(JSON.stringify(stack.logs), [...secretMaterial(hookSecret), ...signatureMaterial(receiver.requests)]);
   assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
@@ -478,8 +478,8 @@ test('a whsec_ webhook is signed again on each attempt and keeps one id per even
   await stack.host.settlePending();
   assert.equal(receiver.requests.length, 2);
   const [first, second] = receiver.requests;
-  assert.equal(header(first.headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
-  assert.equal(header(second.headers, 'webhook-id'), `pending_${APPROVAL_ID}`);
+  assert.equal(header(first.headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
+  assert.equal(header(second.headers, 'webhook-id'), `pending_${APPROVAL_ID}_1`);
   assert.notEqual(header(first.headers, 'webhook-timestamp'), header(second.headers, 'webhook-timestamp'));
   assert.notEqual(header(first.headers, 'webhook-signature'), header(second.headers, 'webhook-signature'));
   assert.notEqual(header(first.headers, 'x-timon-timestamp'), header(second.headers, 'x-timon-timestamp'));
@@ -494,7 +494,7 @@ test('a whsec_ webhook is signed again on each attempt and keeps one id per even
   assert.equal(receiver.requests.length, 3);
   const resolved = receiver.requests[2];
   assert.equal(JSON.parse(resolved.body).event, 'resolved');
-  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}`);
+  assert.equal(header(resolved.headers, 'webhook-id'), `resolved_${APPROVAL_ID}_1`);
   assert.notEqual(header(resolved.headers, 'webhook-id'), header(first.headers, 'webhook-id'));
   verifySignature(resolved, hookSecret);
 
@@ -509,6 +509,125 @@ test('a whsec_ webhook is signed again on each attempt and keeps one id per even
     assert.equal(request.body.includes(hookSecret), false);
     assert.equal(request.body.includes(decoded), false);
     assert.equal(request.body.includes(cardSecret), false);
+  }
+});
+
+test('a later occurrence gets a new webhook id, and a restart reuses an unrecorded one', async (t) => {
+  const cardSecret = randomBytes(24).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  let release = () => {};
+  let hold = false;
+  const receiver = await startReceiver(() => {
+    if (!hold) return { status: 204 };
+    return new Promise((resolve) => {
+      release = () => resolve({ status: 204 });
+    });
+  });
+  t.after(() => receiver.close());
+  const env = {
+    TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+    TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+  };
+  const stack = await openStack(t, { env, sleep: async () => {} });
+  /** @type {Awaited<ReturnType<typeof startStandalone>> | null} */
+  let extra = null;
+  t.after(async () => {
+    if (extra) await extra.close();
+  });
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  hold = true;
+  await stack.host.pollPending();
+  await waitUntil(() => receiver.requests.length === 1, 1000);
+  const pendingFirst = header(receiver.requests[0].headers, 'webhook-id');
+  assert.equal(pendingFirst, `pending_${APPROVAL_ID}_1`);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_pending_cards WHERE id = ?').get(APPROVAL_ID), undefined);
+  assert.equal(stack.host.ctx.sql.prepare('SELECT id FROM host_pending_webhook_seq WHERE id = ?').get(APPROVAL_ID), undefined);
+
+  const closing = stack.host.close();
+  release();
+  hold = false;
+  await closing;
+
+  extra = await startStandalone({
+    port: 0,
+    daemonUrl: stack.daemon.origin,
+    tokenFile: stack.tokenFile,
+    dbFile: stack.dbFile,
+    env: { [BEARER_SECRET]: stack.bearer, ...env },
+    pendingPoll: false,
+    sleep: async () => {},
+    journal: [],
+    logs: [],
+  });
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 2);
+  assert.equal(header(receiver.requests[1].headers, 'webhook-id'), pendingFirst);
+  verifySignature(receiver.requests[0], hookSecret);
+  verifySignature(receiver.requests[1], hookSecret);
+  const recorded = extra.ctx.sql.prepare(
+    'SELECT c.event AS event, s.pending_seq AS pending_seq, s.resolved_seq AS resolved_seq FROM host_pending_cards AS c JOIN host_pending_webhook_seq AS s ON s.id = c.id WHERE c.id = ?',
+  ).get(APPROVAL_ID);
+  assert.equal(recorded.event, 'pending');
+  assert.equal(Number(recorded.pending_seq), 1);
+  assert.equal(Number(recorded.resolved_seq), 0);
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 3);
+  const resolvedFirst = header(receiver.requests[2].headers, 'webhook-id');
+  assert.equal(resolvedFirst, `resolved_${APPROVAL_ID}_1`);
+  verifySignature(receiver.requests[2], hookSecret);
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 4);
+  const pendingSecond = header(receiver.requests[3].headers, 'webhook-id');
+  assert.equal(pendingSecond, `pending_${APPROVAL_ID}_2`);
+  verifySignature(receiver.requests[3], hookSecret);
+  assert.equal(new Set([pendingFirst, resolvedFirst, pendingSecond]).size, 3);
+
+  stack.daemon.permissions.delete(APPROVAL_ID);
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 5);
+  const resolvedSecond = header(receiver.requests[4].headers, 'webhook-id');
+  assert.equal(resolvedSecond, `resolved_${APPROVAL_ID}_2`);
+  assert.notEqual(resolvedSecond, resolvedFirst);
+  verifySignature(receiver.requests[4], hookSecret);
+
+  extra.ctx.sql.prepare('UPDATE host_pending_cards SET updated_at = 0 WHERE id = ?').run(APPROVAL_ID);
+  const insert = extra.ctx.sql.prepare(
+    'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
+  );
+  for (let i = 0; i < RESOLVED_ROW_CAP; i += 1) {
+    const id = `88888888-8888-4888-8888-${String(i).padStart(12, '0')}`;
+    insert.run(id, 'resolved', JSON.stringify({ id }), i + 1);
+  }
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 5, 'purging a resolved row does not send it again');
+  assert.equal(extra.ctx.sql.prepare('SELECT id FROM host_pending_cards WHERE id = ?').get(APPROVAL_ID), undefined);
+  const kept = extra.ctx.sql.prepare(
+    'SELECT pending_seq, resolved_seq FROM host_pending_webhook_seq WHERE id = ?',
+  ).get(APPROVAL_ID);
+  assert.equal(Number(kept.pending_seq), 2);
+  assert.equal(Number(kept.resolved_seq), 2);
+
+  stack.daemon.permissions.set(APPROVAL_ID, approvalCard(cardSecret));
+  await extra.pollPending();
+  await extra.settlePending();
+  assert.equal(receiver.requests.length, 6);
+  assert.equal(header(receiver.requests[5].headers, 'webhook-id'), `pending_${APPROVAL_ID}_3`);
+  verifySignature(receiver.requests[5], hookSecret);
+  for (const request of receiver.requests) {
+    assert.equal(request.body.includes(cardSecret), false);
+    assert.equal(request.body.includes(hookSecret), false);
+    assert.match(header(request.headers, 'x-timon-signature'), /^v1=/);
+    assert.match(header(request.headers, 'webhook-signature'), /^v1,/);
   }
 });
 
@@ -678,7 +797,12 @@ test('resolved rows stay bounded and a busy poll ignores the next tick', async (
       event TEXT NOT NULL CHECK (event IN ('pending', 'resolved')),
       projection TEXT NOT NULL,
       updated_at INTEGER NOT NULL
-    )
+    );
+    CREATE TABLE host_pending_webhook_seq (
+      id TEXT PRIMARY KEY,
+      pending_seq INTEGER NOT NULL DEFAULT 0,
+      resolved_seq INTEGER NOT NULL DEFAULT 0
+    );
   `);
   const insert = db.prepare(
     'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
