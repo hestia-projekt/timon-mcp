@@ -11,10 +11,30 @@ const PROJECT_BODY = PROJECT_PATTERN.slice(1, -1);
 export const PROJECT_NAME = new RegExp(`^${PROJECT_BODY}$`);
 
 /**
- * An agent the operator already has: the pilot `_main`, or `<project>.<role>`.
- * One dot. The host does not create the agent.
+ * Longest agent name release 0.1.8 mints.
+ *
+ * `validName` in `agent-config.js` is `NAME_RE` `/^[A-Za-z0-9._-]+$/` and
+ * states no length. The length is the longer name the other rules build:
+ * a project slug is 1..64 (`projects.js` `SLUG_RE`) and a role id is 2..32
+ * (`agent-roles.js` `ID_RE`, one letter then `{1,31}`), so `<slug>.<role>`
+ * (`agent-seed.js`) is 97 characters. An ephemeral name is `_eph-` plus a
+ * hint of at most 24 plus `-` plus 8 hex (`createEphemeralAgent`), which is
+ * 38. One past 97 is not a name those rules produce.
+ * `isNamedAgent`, `isAgentPath`, `isDisplayAgent`, and the tool schemas share
+ * this ceiling, so a read keeps every minted name and drops one character more.
  */
-export const NAMED_AGENT = new RegExp(`^(?:${PILOT_AGENT}|${PROJECT_BODY}\\.${PROJECT_BODY})$`);
+const DAEMON_CANONICAL_MAX = 64 + 1 + 32;
+const DAEMON_EPHEMERAL_MAX = 5 + 24 + 1 + 8;
+export const AGENT_NAME_MAX = Math.max(DAEMON_CANONICAL_MAX, DAEMON_EPHEMERAL_MAX);
+
+/**
+ * An agent the operator already has: the pilot `_main`, or `<project>.<role>`.
+ * One dot. The host does not create the agent. The lookahead is
+ * `AGENT_NAME_MAX`, the same ceiling as a read.
+ */
+export const NAMED_AGENT = new RegExp(
+  `^(?=.{1,${AGENT_NAME_MAX}}$)(?:${PILOT_AGENT}|${PROJECT_BODY}\\.${PROJECT_BODY})$`,
+);
 
 /** Mission ids this host will place in a path. Dots are out: they are route words. */
 export const MISSION_ID = /^[A-Za-z0-9_-]{1,200}$/;
@@ -113,17 +133,17 @@ export function isProject(value) {
  * @param {unknown} value
  */
 export function isNamedAgent(value) {
-  return typeof value === 'string' && NAMED_AGENT.test(value);
+  return typeof value === 'string' && value.length <= AGENT_NAME_MAX && NAMED_AGENT.test(value);
 }
 
 /**
  * An agent name the daemon will show.
- * Release 0.1.8 `validName` in `agent-config.js` is `/^[A-Za-z0-9._-]+$/`.
- * This host keeps that shape and caps it at 80 characters. An ephemeral id
- * (`_eph-…`) matches. A launch or a direct message stays `isNamedAgent`.
- * A name this host places on a path uses `isAgentPath`.
+ * Same characters as release 0.1.8 `validName`, capped at `AGENT_NAME_MAX`.
+ * An ephemeral id (`_eph-…`) matches. A launch or a direct message stays
+ * `isNamedAgent`. A name this host places on a path uses `isAgentPath`.
  */
-export const DISPLAY_AGENT = /^[A-Za-z0-9._-]{1,80}$/;
+const AGENT_CHARS = `[A-Za-z0-9._-]{1,${AGENT_NAME_MAX}}`;
+export const DISPLAY_AGENT = new RegExp(`^${AGENT_CHARS}$`);
 
 /**
  * @param {unknown} value
@@ -140,8 +160,11 @@ export function isDisplayAgent(value) {
  * it can be placed on a path: `.` alone, a name that contains `..`, a
  * percent-encoding (`%` is outside the display grammar, so `%2f` fails),
  * and the route words `active`, `spawn`, `ephemeral`, and `main`.
+ * The length is `AGENT_NAME_MAX`, the same ceiling as `isDisplayAgent`.
  */
-export const AGENT_PATH = /^(?!(?:active|spawn|ephemeral|main)$)(?!\.$)(?!.*\.\.)[A-Za-z0-9._-]{1,80}$/;
+export const AGENT_PATH = new RegExp(
+  `^(?!(?:active|spawn|ephemeral|main)$)(?!\\.$)(?!.*\\.\\.)${AGENT_CHARS}$`,
+);
 
 /**
  * @param {unknown} value

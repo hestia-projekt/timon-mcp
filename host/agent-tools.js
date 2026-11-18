@@ -9,10 +9,10 @@
  * and counts against the spawn window. Kind `msg` does not.
  */
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
-import { AGENT_PATH, MESSAGE_KIND_NAMES, NAMED_AGENT, PROJECT_NAME } from './names.js';
+import { AGENT_NAME_MAX, AGENT_PATH, MESSAGE_KIND_NAMES, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
-const namedAgent = { type: 'string', pattern: NAMED_AGENT.source };
-const readAgent = { type: 'string', pattern: AGENT_PATH.source };
+const namedAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: NAMED_AGENT.source };
+const readAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: AGENT_PATH.source };
 const projectName = { type: 'string', pattern: PROJECT_NAME.source };
 const limit = { type: 'integer', minimum: 1, maximum: 100 };
 
