@@ -9,11 +9,11 @@
  * `blocked_reason` is the reason stored for `BLOCKED`. There is no delete.
  */
 import { MESSAGE_MAX_CHARS } from '../lib/constants.js';
-import { AGENT_NAME_MAX, AGENT_PATH, MISSION_ID, NAMED_AGENT, PROJECT_NAME, TASK_STATUS_NAMES, TASK_TYPE_NAMES } from './names.js';
+import { AGENT_NAME_MAX, AGENT_PATH, AGENT_READ_MAX, MISSION_ID, NAMED_AGENT, PROJECT_NAME, TASK_STATUS_NAMES, TASK_TYPE_NAMES } from './names.js';
 
 const taskId = { type: 'string', minLength: 1, maxLength: 200, pattern: MISSION_ID.source };
 const namedAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: NAMED_AGENT.source };
-const readAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: AGENT_PATH.source };
+const readAgent = { type: 'string', maxLength: AGENT_READ_MAX, pattern: AGENT_PATH.source };
 const projectName = { type: 'string', pattern: PROJECT_NAME.source };
 const priority = { type: 'integer', minimum: -1000, maximum: 1000 };
 const deps = {

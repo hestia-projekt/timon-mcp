@@ -26,7 +26,7 @@ import { ROSTER_TOOLS } from './agent-tools.js';
 import { KANBAN_TOOLS } from './kanban-tools.js';
 import { DECISION_TOOLS } from './decision-tools.js';
 import { PENDING_TOOLS } from './pending-tools.js';
-import { AGENT_NAME_MAX, AGENT_PATH, MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
+import { AGENT_NAME_MAX, AGENT_PATH, AGENT_READ_MAX, MISSION_ID, NAMED_AGENT, PROJECT_NAME } from './names.js';
 
 const STATUS_ENUM = ['running', 'completed', 'failed', 'terminated'];
 
@@ -49,7 +49,7 @@ function schema(description, properties, required) {
 
 const missionId = { type: 'string', minLength: 1, maxLength: 200, pattern: MISSION_ID.source };
 const namedAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: NAMED_AGENT.source };
-const readAgent = { type: 'string', maxLength: AGENT_NAME_MAX, pattern: AGENT_PATH.source };
+const readAgent = { type: 'string', maxLength: AGENT_READ_MAX, pattern: AGENT_PATH.source };
 const message = { type: 'string', minLength: 1, maxLength: MESSAGE_MAX_CHARS };
 
 export const MISSION_TOOLS = [
