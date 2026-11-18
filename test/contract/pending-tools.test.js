@@ -346,7 +346,7 @@ test('without a webhook URL the poller records cards and sends nothing', async (
   assert.equal(stored.projection.includes(secret), false);
   assert.equal(stored.projection.includes('input'), false);
   assert.equal(stored.projection.includes('"entry"'), false);
-  assert.equal(stored.projection.includes('"command"'), false);
+  assert.equal(JSON.parse(stored.projection).command, 'echo [redacted]');
   assert.equal(stored.projection.includes('VISIBLE'), false);
   assert.equal(JSON.stringify(stack.logs).includes(secret), false);
 });
@@ -388,7 +388,6 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
   assert.equal(delivered.body.includes(hookSecret), false);
   assert.equal(delivered.body.includes('"input"'), false);
   assert.equal(delivered.body.includes('"entry"'), false);
-  assert.equal(delivered.body.includes('"command"'), false);
   assert.equal(delivered.body.includes('shell_command'), false);
   assert.equal(delivered.body.includes('script_previews'), false);
   assert.equal(delivered.body.includes('VISIBLE'), false);
@@ -402,6 +401,7 @@ test('a webhook is signed, deduplicated, and retried a bounded number of times',
     created_at: 3000,
     expires_at: 4000,
     tool_name: 'bash',
+    command: 'echo [redacted]',
   });
   verifySignature(delivered, hookSecret);
 
@@ -765,11 +765,11 @@ test('an ephemeral agent is listed and notified, and a bad card is dropped by id
     created_at: 1000,
     expires_at: 2000,
     tool_name: 'bash',
+    command: 'echo [redacted]',
   });
   assert.equal(delivered.body.includes(secret), false);
   assert.equal(delivered.body.includes(hookSecret), false);
   assert.equal(delivered.body.includes('"input"'), false);
-  assert.equal(delivered.body.includes('"command"'), false);
   assert.equal(delivered.body.includes('"entry"'), false);
   assert.equal(delivered.body.includes('bad agent'), false);
   assert.equal(delivered.body.includes(BAD_ID), false);
@@ -942,7 +942,7 @@ test('a card the daemon still lists is not resolved when the projection rejects 
   assert.equal(receiver.requests.length, 2);
   assert.equal(JSON.parse(receiver.requests[1].body).event, 'resolved');
   assert.equal(receiver.requests[1].body.includes(secret), false);
-  assert.equal(receiver.requests[1].body.includes('"command"'), false);
+  assert.equal(JSON.parse(receiver.requests[1].body).card.command, 'echo [redacted]');
 });
 
 test('a poll does not wait for a silent receiver, and the delivery queue is capped', async (t) => {
@@ -994,7 +994,7 @@ test('a poll does not wait for a silent receiver, and the delivery queue is capp
   assert.equal(receiver.requests.length, DELIVERY_QUEUE_CAP);
   for (const request of receiver.requests) {
     assert.equal(request.body.includes(secret), false);
-    assert.equal(request.body.includes('"command"'), false);
+    assert.equal(JSON.parse(request.body).card.command, 'echo [redacted]');
     assert.equal(request.body.includes('"entry"'), false);
     assert.equal(request.body.includes('shell_command'), false);
     assert.equal(request.body.includes('script_previews'), false);
@@ -1007,6 +1007,339 @@ test('a poll does not wait for a silent receiver, and the delivery queue is capp
   assert.equal(receiver.requests.length, total);
   const all = stack.host.ctx.sql.prepare("SELECT COUNT(*) AS n FROM host_pending_cards WHERE event = 'pending'").get();
   assert.equal(Number(all.n), total);
+});
+
+test('a backtick tool name is the approval command on list_pending and on the webhook', async (t) => {
+  const token = randomBytes(18).toString('hex');
+  const hex40 = randomBytes(20).toString('hex');
+  const hookSecret = randomBytes(32).toString('hex');
+  assert.equal(token.length, 36);
+  assert.equal(hex40.length, 40);
+  assert.notEqual(token, hex40);
+  assert.notEqual(token, hookSecret);
+
+  const taskUuid = 'ecb49f3e-e001-4dfc-a68b-5c9181b7b6f9';
+  assert.equal(taskUuid.replaceAll('-', '').length, 32);
+  assert.equal(/[0-9a-fA-F]{32,}/.test(taskUuid), false, 'dashes split a UUID, so it is not a 32-hex run');
+
+  const statusCmd = 'git status --short --branch';
+  const logCmd = `git log --oneline timon/task/${taskUuid}..HEAD`;
+  const diffCmd = `git diff --stat timon/task/${taskUuid}...HEAD | tail -5`;
+  const sensitive = `curl -H Authorization: Bearer ${token} https://example.test/${hex40}`;
+  const longCmd = `echo ${'x'.repeat(180)}`;
+  assert.ok(longCmd.length > 160);
+  const quote = (command) => `\`${command}\``;
+
+  const receiver = await startReceiver(() => ({ status: 204 }));
+  t.after(() => receiver.close());
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+
+  /**
+   * @param {number} n
+   * @param {string} toolName
+   * @param {Record<string, unknown>} input
+   */
+  const approval = (n, toolName, input) => ({
+    id: `aa000000-0000-4000-8000-${String(n).padStart(12, '0')}`,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    tool_name: toolName,
+    tool_use_id: token,
+    input,
+    shell_command: token,
+    script_previews: [{ body: hex40 }],
+    onPaste: token,
+    scopes: ['session'],
+    created_at: n,
+    timeout_ms: 1000,
+  });
+  const cases = [
+    approval(1, quote(statusCmd), {}),
+    approval(2, quote(logCmd), {}),
+    approval(3, quote(diffCmd), {}),
+    approval(4, quote(sensitive), {}),
+    approval(5, quote(longCmd), {}),
+    approval(6, 'rm -rf /tmp/x', {}),
+    approval(7, '`a` `b`', {}),
+    approval(8, '`git status', {}),
+    approval(9, 'run `git status` now', {}),
+    approval(10, ` ${quote(statusCmd)} `, {}),
+    approval(11, quote(statusCmd), { command: `printf Authorization: Bearer ${token} ${hex40}`, note: token }),
+    approval(12, quote(statusCmd), { command: '' }),
+    approval(13, 'bash', {}),
+    approval(14, `${quote(statusCmd)}\n`, {}),
+    approval(15, `${quote(statusCmd)}\r\n`, {}),
+    approval(16, `${quote(statusCmd)}\u2028`, {}),
+  ];
+  for (const raw of cases) stack.daemon.permissions.set(raw.id, raw);
+  stack.daemon.permissions.set(QUESTION_ID, {
+    id: QUESTION_ID,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    tool_name: 'ask_user',
+    input: {
+      message: token,
+      questions: [{ question: 'Ship it?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+      secret: token,
+    },
+    shell_command: token,
+    script_previews: [hex40],
+    created_at: 100,
+    timeout_ms: 1000,
+  });
+  stack.daemon.permissions.set(PLAN_ID, {
+    id: PLAN_ID,
+    mission_id: 'foreignmission01',
+    agent: '_main',
+    tool_name: 'ask_user',
+    input: {
+      message: token,
+      form: {
+        kind: 'series_plan',
+        chantier: 'Notifications',
+        volets: [{ title: 'Probe', description: 'Read cards', group: 'host', secret: token }],
+      },
+    },
+    shell_command: token,
+    script_previews: [hex40],
+    created_at: 200,
+    timeout_ms: 0,
+  });
+
+  const listed = await call(stack, 'list_pending', {});
+  assert.equal(listed.body.result.isError, false);
+  const cards = listed.body.result.structuredContent.cards;
+  const byId = Object.fromEntries(cards.map((card) => [card.id, card]));
+  const approvalId = (n) => `aa000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const expectApproval = (n, toolName, command) => ({
+    type: 'approval',
+    id: approvalId(n),
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: n,
+    expires_at: n + 1000,
+    tool_name: toolName,
+    command,
+  });
+
+  assert.deepEqual(byId[approvalId(1)], expectApproval(1, 'shell', statusCmd));
+  assert.deepEqual(byId[approvalId(2)], expectApproval(2, 'shell', logCmd));
+  assert.deepEqual(byId[approvalId(3)], expectApproval(3, 'shell', diffCmd));
+  assert.equal(byId[approvalId(2)].command.includes(taskUuid), true);
+  assert.equal(byId[approvalId(3)].command.includes(taskUuid), true);
+  assert.equal(byId[approvalId(2)].command.includes('[redacted]'), false);
+  assert.deepEqual(
+    byId[approvalId(4)],
+    expectApproval(4, 'shell', 'curl -H Authorization: Bearer [redacted] https://example.test/[redacted]'),
+  );
+  assert.equal(byId[approvalId(4)].command.includes(token), false);
+  assert.equal(byId[approvalId(4)].command.includes(hex40), false);
+  assert.equal(byId[approvalId(5)].command.length, 160);
+  assert.equal(byId[approvalId(5)].command, longCmd.slice(0, 160));
+  assert.deepEqual(byId[approvalId(5)], expectApproval(5, 'shell', longCmd.slice(0, 160)));
+  for (const n of [6, 7, 8, 9, 10, 14, 15, 16]) {
+    assert.deepEqual(byId[approvalId(n)], expectApproval(n, 'tool', null));
+  }
+  assert.deepEqual(
+    byId[approvalId(11)],
+    expectApproval(11, 'tool', 'printf Authorization: Bearer [redacted] [redacted]'),
+  );
+  assert.equal(byId[approvalId(11)].command.includes(statusCmd), false);
+  assert.deepEqual(byId[approvalId(12)], expectApproval(12, 'shell', statusCmd));
+  assert.deepEqual(byId[approvalId(13)], expectApproval(13, 'bash', null));
+  assert.deepEqual(byId[QUESTION_ID], {
+    type: 'question',
+    id: QUESTION_ID,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: 100,
+    expires_at: 1100,
+    questions: [{
+      question: 'Ship it?',
+      header: null,
+      options: [
+        { label: 'Yes', description: null, actor: null },
+        { label: 'No', description: null, actor: null },
+      ],
+      multi_select: false,
+      placeholder: null,
+    }],
+    plan: null,
+  });
+  assert.deepEqual(byId[PLAN_ID], {
+    type: 'series_plan',
+    id: PLAN_ID,
+    mission_id: 'foreignmission01',
+    agent: '_main',
+    created_at: 200,
+    expires_at: null,
+    questions: [],
+    plan: {
+      title: 'Notifications',
+      volets: [{ title: 'Probe', description: 'Read cards', group: 'host' }],
+    },
+  });
+  assert.equal(Object.hasOwn(byId[QUESTION_ID], 'command'), false);
+  assert.equal(Object.hasOwn(byId[PLAN_ID], 'command'), false);
+  for (const card of cards) {
+    assert.equal(Object.hasOwn(card, 'input'), false);
+    assert.equal(Object.hasOwn(card, 'entry'), false);
+    assert.equal(Object.hasOwn(card, 'shell_command'), false);
+    assert.equal(Object.hasOwn(card, 'script_previews'), false);
+    assert.equal(Object.hasOwn(card, 'onPaste'), false);
+    assert.equal(Object.hasOwn(card, 'tool_use_id'), false);
+    const text = JSON.stringify(card);
+    assert.equal(text.includes(token), false);
+    assert.equal(text.includes(hex40), false);
+  }
+  assert.equal(listed.text.includes(token), false);
+  assert.equal(listed.text.includes(hex40), false);
+
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, cards.length);
+  for (const request of receiver.requests) {
+    const payload = JSON.parse(request.body);
+    assert.equal(payload.event, 'pending');
+    assert.deepEqual(payload.card, byId[payload.card.id]);
+    assert.equal(request.body.includes(token), false);
+    assert.equal(request.body.includes(hex40), false);
+    assert.equal(request.body.includes(hookSecret), false);
+    assert.equal(request.body.includes('"input"'), false);
+    assert.equal(request.body.includes('"entry"'), false);
+    assert.equal(request.body.includes('shell_command'), false);
+    assert.equal(request.body.includes('script_previews'), false);
+    verifySignature(request, hookSecret);
+  }
+  const questionHook = receiver.requests.map((request) => JSON.parse(request.body).card).find((card) => card.id === QUESTION_ID);
+  const planHook = receiver.requests.map((request) => JSON.parse(request.body).card).find((card) => card.id === PLAN_ID);
+  assert.equal(Object.hasOwn(questionHook, 'command'), false);
+  assert.equal(Object.hasOwn(planHook, 'command'), false);
+  assert.equal(JSON.stringify(stack.logs).includes(token), false);
+  assert.equal(JSON.stringify(stack.logs).includes(hex40), false);
+  assert.equal(JSON.stringify(stack.logs).includes('git status'), false);
+  assert.equal(JSON.stringify(stack.logs).includes('rm -rf'), false);
+  assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
+});
+
+test('a resolved webhook adds command null on an old approval and leaves a question', async (t) => {
+  const hookSecret = randomBytes(32).toString('hex');
+  const receiver = await startReceiver(() => ({ status: 204 }));
+  t.after(() => receiver.close());
+  const stack = await openStack(t, {
+    env: {
+      TIMON_MCP_PENDING_WEBHOOK_URL: receiver.url,
+      TIMON_MCP_PENDING_WEBHOOK_SECRET: hookSecret,
+    },
+    sleep: async () => {},
+  });
+
+  const oldApprovalId = '99999999-9999-4999-8999-999999999999';
+  const oldQuestionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const oldPlanId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const keptId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const keptCommand = 'git status --short --branch';
+  const approval = {
+    type: 'approval',
+    id: oldApprovalId,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: 1,
+    expires_at: null,
+    tool_name: 'bash',
+  };
+  const question = {
+    type: 'question',
+    id: oldQuestionId,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: 2,
+    expires_at: null,
+    questions: [{
+      question: 'Ship it?',
+      header: null,
+      options: [
+        { label: 'Yes', description: null, actor: null },
+        { label: 'No', description: null, actor: null },
+      ],
+      multi_select: false,
+      placeholder: null,
+    }],
+    plan: null,
+  };
+  const plan = {
+    type: 'series_plan',
+    id: oldPlanId,
+    mission_id: 'foreignmission01',
+    agent: '_main',
+    created_at: 3,
+    expires_at: null,
+    questions: [],
+    plan: { title: 'Notifications', volets: [] },
+  };
+  const kept = {
+    type: 'approval',
+    id: keptId,
+    mission_id: 'foreignmission01',
+    agent: 'alpha.coder',
+    created_at: 4,
+    expires_at: null,
+    tool_name: 'shell',
+    command: keptCommand,
+  };
+  assert.equal(Object.hasOwn(approval, 'command'), false);
+  assert.equal(Object.hasOwn(question, 'command'), false);
+  assert.equal(Object.hasOwn(plan, 'command'), false);
+  assert.equal(stack.daemon.permissions.has(oldApprovalId), false);
+  assert.equal(stack.daemon.permissions.has(oldQuestionId), false);
+
+  const insert = stack.host.ctx.sql.prepare(
+    'INSERT INTO host_pending_cards (id, event, projection, updated_at) VALUES (?, ?, ?, ?)',
+  );
+  insert.run(oldApprovalId, 'pending', JSON.stringify(approval), 1);
+  insert.run(oldQuestionId, 'pending', JSON.stringify(question), 2);
+  insert.run(oldPlanId, 'pending', JSON.stringify(plan), 3);
+  insert.run(keptId, 'pending', JSON.stringify(kept), 4);
+
+  await stack.host.pollPending();
+  await stack.host.settlePending();
+  assert.equal(receiver.requests.length, 4);
+  /** @type {Record<string, Record<string, unknown>>} */
+  const byId = {};
+  for (const request of receiver.requests) {
+    const payload = JSON.parse(request.body);
+    assert.equal(payload.event, 'resolved');
+    byId[payload.card.id] = payload.card;
+    assert.equal(request.body.includes('"input"'), false);
+    assert.equal(request.body.includes('shell_command'), false);
+    verifySignature(request, hookSecret);
+  }
+  assert.deepEqual(byId[oldApprovalId], { ...approval, command: null });
+  assert.equal(byId[oldApprovalId].command, null);
+  assert.equal(Object.hasOwn(byId[oldApprovalId], 'command'), true);
+  assert.deepEqual(byId[oldQuestionId], question);
+  assert.equal(Object.hasOwn(byId[oldQuestionId], 'command'), false);
+  assert.deepEqual(byId[oldPlanId], plan);
+  assert.equal(Object.hasOwn(byId[oldPlanId], 'command'), false);
+  assert.deepEqual(byId[keptId], kept);
+  assert.equal(JSON.stringify(stack.logs).includes(keptCommand), false);
+  assert.equal(JSON.stringify(stack.logs).includes(hookSecret), false);
+
+  const stored = stack.host.ctx.sql.prepare(
+    'SELECT event, projection FROM host_pending_cards WHERE id = ?',
+  );
+  const storedApproval = stored.get(oldApprovalId);
+  const storedQuestion = stored.get(oldQuestionId);
+  assert.equal(storedApproval.event, 'resolved');
+  assert.equal(JSON.parse(storedApproval.projection).command, null);
+  assert.equal(storedQuestion.event, 'resolved');
+  assert.equal(Object.hasOwn(JSON.parse(storedQuestion.projection), 'command'), false);
 });
 
 /**
