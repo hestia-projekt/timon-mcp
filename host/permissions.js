@@ -8,10 +8,9 @@
  * A renderable `ask_user` card is a question or a kanban plan. The fields are
  * the whitelist of `projectQuestion` (`questions-facade.js`). Anything else is
  * a tool approval. `projectCard` is the webhook projection: type, id, tool,
- * mission, agent, and dates, plus that whitelist for a question. It carries
- * no tool input. `projectListedCard` is the authenticated `list_pending`
- * view of the same card. An approval there adds a bounded redacted preview
- * of `input.command` and nothing else from the input.
+ * mission, agent, and dates, plus that whitelist for a question. An approval
+ * also carries `command` (the same value `list_pending` returns). It carries
+ * no other tool input. `projectListedCard` is that same projection.
  * `questionKindOf` is the same split as the release (`permissions.js`):
  * `ask_user` whose payload does not validate is not a question.
  */
@@ -36,6 +35,11 @@ const COMMAND_PREVIEW_MAX = 160;
 /** Lowercase UUID, the only card id this host will place on a resolve path. */
 export const CARD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
+/**
+ * One backtick segment covering the whole string. Not trimmed: a surrounding
+ * space, two segments, or a partial wrap is not a command.
+ */
+const BACKTICK_COMMAND = /^`([^`]+)`$/;
 const BEARER_VALUE = /Bearer\s+\S+/gi;
 const LONG_HEX = /[0-9a-fA-F]{32,}/g;
 
@@ -163,6 +167,8 @@ export function questionKindOf(card) {
 
 /**
  * Bearer tokens and long hex runs, then the preview cap.
+ * The only cleaner: `input.command` and a backtick tool name both pass through it.
+ * A dashed UUID is not a hex run of 32 or more: the dashes split the run.
  * @param {string} value
  * @returns {string}
  */
@@ -172,14 +178,43 @@ function redactString(value) {
 }
 
 /**
- * Preview of a tool command for `list_pending`. `null` when `input.command`
- * is not a string. No other input field is read.
+ * Preview of a tool command. `null` when `input.command` is not a string.
+ * No other input field is read. An empty string is kept.
  * @param {unknown} input
  * @returns {string | null}
  */
 export function commandPreview(input) {
   if (!isPlain(input) || typeof input.command !== 'string') return null;
   return redactString(input.command);
+}
+
+/**
+ * Text inside one backtick segment, or `null` when the name is not exactly that.
+ * @param {unknown} toolName
+ * @returns {string | null}
+ */
+function backtickCommand(toolName) {
+  if (typeof toolName !== 'string') return null;
+  const match = BACKTICK_COMMAND.exec(toolName);
+  return match ? match[1] : null;
+}
+
+/**
+ * Approval command, and whether the projected tool name becomes `shell`.
+ * A non-empty `input.command` wins (the tool name stays as it is today).
+ * Otherwise a tool name that is exactly one backtick segment supplies the
+ * text. An empty command string is kept only when the name is not such a segment.
+ * @param {Record<string, unknown>} raw
+ * @returns {{ command: string | null, fromName: boolean }}
+ */
+function approvalCommand(raw) {
+  const input = isPlain(raw.input) ? raw.input : null;
+  if (input && typeof input.command === 'string' && input.command !== '') {
+    return { command: redactString(input.command), fromName: false };
+  }
+  const wrapped = backtickCommand(raw.tool_name);
+  if (wrapped !== null) return { command: redactString(wrapped), fromName: true };
+  return { command: commandPreview(input), fromName: false };
 }
 
 /**
@@ -227,8 +262,8 @@ function timestamp(value) {
 /**
  * One card, or `null` when the id, mission, or agent cannot be shown.
  * The agent is a display name (`shownAgent`), including `_eph-…`. `.` and `..` are dropped.
- * The returned object is built field by field. An approval has no tool input:
- * that shape is what a webhook may carry.
+ * The returned object is built field by field. An approval carries `command`
+ * and no other tool input: that shape is what a webhook may carry.
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
  */
@@ -271,22 +306,24 @@ export function projectCard(raw) {
       plan: null,
     };
   }
-  const toolName = typeof raw.tool_name === 'string' && TOOL_NAME.test(raw.tool_name) ? raw.tool_name : 'tool';
+  const { command, fromName } = approvalCommand(raw);
+  const toolName = fromName
+    ? 'shell'
+    : (typeof raw.tool_name === 'string' && TOOL_NAME.test(raw.tool_name) ? raw.tool_name : 'tool');
   return {
     type: 'approval',
     ...base,
     tool_name: toolName,
+    command,
   };
 }
 
 /**
- * Authenticated list. Same card as `projectCard`, and for an approval the
- * command preview only. `shell_command` and `script_previews` are not read.
+ * Authenticated list. Same card as the webhook projection, including an
+ * approval's `command`. `shell_command` and `script_previews` are not read.
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
  */
 export function projectListedCard(raw) {
-  const card = projectCard(raw);
-  if (!card || card.type !== 'approval') return card;
-  return { ...card, command: commandPreview(isPlain(raw) ? raw.input : null) };
+  return projectCard(raw);
 }
