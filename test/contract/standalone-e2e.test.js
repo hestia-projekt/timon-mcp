@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { assertHermesHandshake } from '../helpers/hermes-handshake.js';
 import { openStack } from '../helpers/standalone.js';
 
 test('initialize, tools/list and ask_main stay on the closed daemon routes', async (t) => {
@@ -60,6 +61,25 @@ test('initialize, tools/list and ask_main stay on the closed daemon routes', asy
   ]);
   assert.equal(JSON.stringify(stack.logs).includes(stack.token), false);
   assert.equal(JSON.stringify(stack.journal).includes(stack.token), false);
+});
+
+test('the standalone host negotiates Hermes initialize from the body', async (t) => {
+  const stack = await openStack(t);
+  await assertHermesHandshake(async (body, headers = {}) => {
+    const response = await fetch(`${stack.host.baseUrl}/api/plugins/timon-mcp/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${stack.bearer}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        ...headers,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    return { status: response.status, json: text ? JSON.parse(text) : null };
+  });
+  assert.equal(stack.daemon.requests.length, 0);
 });
 
 /**

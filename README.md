@@ -48,7 +48,7 @@ Until the plugin is signed, `missions:spawn` stays refused until the id is appro
 
 `POST /api/plugins/timon-mcp/mcp`
 
-JSON-RPC 2.0, one request per call, response `application/json`. No SSE stream, no session. `Mcp-Session-Id` is optional and ignored. The spoken revisions are `2025-06-18` and `2025-03-26`. An unknown version at initialization receives the latest. A present and unknown `MCP-Protocol-Version` header answers `400`.
+JSON-RPC 2.0, one request per call, response `application/json`. No SSE stream, no session. `Mcp-Session-Id` is optional and ignored. The spoken revisions are `2025-06-18` and `2025-03-26`. An unknown `params.protocolVersion` at initialization receives the latest. On `initialize`, `MCP-Protocol-Version` is not checked. After `initialize`, including on notifications, a present and unknown `MCP-Protocol-Version` answers `400`. An absent header is accepted.
 
 `GET /mcp` and `DELETE /mcp` answer `405` when the handler is reached. On the daemon those methods are not public paths: an anonymous client receives `401` before the handler.
 
