@@ -1073,6 +1073,9 @@ test('a backtick tool name is the approval command on list_pending and on the we
     approval(11, quote(statusCmd), { command: `printf Authorization: Bearer ${token} ${hex40}`, note: token }),
     approval(12, quote(statusCmd), { command: '' }),
     approval(13, 'bash', {}),
+    approval(14, `${quote(statusCmd)}\n`, {}),
+    approval(15, `${quote(statusCmd)}\r\n`, {}),
+    approval(16, `${quote(statusCmd)}\u2028`, {}),
   ];
   for (const raw of cases) stack.daemon.permissions.set(raw.id, raw);
   stack.daemon.permissions.set(QUESTION_ID, {
@@ -1140,7 +1143,7 @@ test('a backtick tool name is the approval command on list_pending and on the we
   assert.equal(byId[approvalId(5)].command.length, 160);
   assert.equal(byId[approvalId(5)].command, longCmd.slice(0, 160));
   assert.deepEqual(byId[approvalId(5)], expectApproval(5, 'shell', longCmd.slice(0, 160)));
-  for (const n of [6, 7, 8, 9, 10]) {
+  for (const n of [6, 7, 8, 9, 10, 14, 15, 16]) {
     assert.deepEqual(byId[approvalId(n)], expectApproval(n, 'tool', null));
   }
   assert.deepEqual(

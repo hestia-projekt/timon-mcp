@@ -37,9 +37,11 @@ export const CARD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,80}$/;
 /**
  * One backtick segment covering the whole string. Not trimmed: a surrounding
- * space, two segments, or a partial wrap is not a command.
+ * space, two segments, or a partial wrap is not a command. The end is asserted
+ * with `(?![\s\S])`, not `$`: it stays the true end of the string even if a
+ * multiline flag is ever added, so a trailing line terminator never matches.
  */
-const BACKTICK_COMMAND = /^`([^`]+)`$/;
+const BACKTICK_COMMAND = /^`([^`]+)`(?![\s\S])/;
 const BEARER_VALUE = /Bearer\s+\S+/gi;
 const LONG_HEX = /[0-9a-fA-F]{32,}/g;
 
